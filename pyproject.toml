@@ -1,0 +1,40 @@
+[project]
+name = "orca"
+version = "0.1.0"
+description = "Orca — a manager LLM that learns transferable delegation strategy over a team of worker LLMs (Architecture C2). Phase 0 foundation."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# Telemetry is optional: the codebase runs (and tests pass) with a no-op /
+# local-JSONL fallback when these are absent or unauthenticated. See
+# telemetry/weave_ops.py.
+telemetry = [
+    "weave>=0.51",
+    "wandb>=0.16",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+# The repo is a flat collection of top-level packages (env/, agents/, ...),
+# per ORCA_master_build_spec.md §11. There is no single src package to install;
+# everything is imported relative to the repo root. We therefore do not declare
+# a build backend — the project is run in-place from the repo root.
+
+[tool.pytest.ini_options]
+# Tests live in tests/ and the coord-leak invariant lives in obs_guard/
+# (coord_leak_test.py doubles as a pytest module, per §11 / §3.2).
+testpaths = ["tests", "obs_guard"]
+python_files = ["test_*.py", "*_test.py"]
+# Make the repo root importable so the flat top-level packages (contracts/,
+# env/, ...) resolve under pytest exactly as they do for `python run.py`.
+pythonpath = ["."]
+addopts = "-ra"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

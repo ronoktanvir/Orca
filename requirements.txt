@@ -1,0 +1,12 @@
+# Orca — Phase 0 core dependencies (Python 3.11).
+# Install:  uv pip install -r requirements.txt   (or pip)
+pydantic>=2.6
+pyyaml>=6.0
+numpy>=1.26
+pytest>=8.0
+
+# Optional telemetry — the codebase runs and all tests pass without these
+# (telemetry/weave_ops.py falls back to a local-JSONL / no-op logger).
+# Install with:  uv pip install -r requirements-telemetry.txt
+#   weave>=0.51
+#   wandb>=0.16

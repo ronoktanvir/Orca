@@ -1,0 +1,36 @@
+# Orca — default config. Every tuning knob lives here (ORCA_master_build_spec §15).
+# This file's structure is part of the frozen handoff (workflow plan §2.4).
+
+run:
+  seed: "A"               # which seed layout to run (train pool {A,T2,T3})
+  n_episodes: 1           # Phase 0: a single end-to-end episode
+  t_max: 600              # §15 rounds/episode cap
+  day_length: 100         # §15 night-danger cadence (time_of_day in obs)
+  stop_at_milestone: "iron"  # Phase 0 shallow target; null => run to t_max
+  message_window: 8       # §5.2 recent_messages K
+  single_agent_oracle: true  # Phase 0 placeholder agent (scripted shallow oracle)
+
+agents:
+  temperature: 0.2        # §15 worker temperature (LLM workers, Stream 2)
+
+reward:
+  weights:                # §7.2 / §15 — kept << a frontier step
+    deaths: 0.02
+    invalid: 0.05
+    idle: 0.05
+
+bandit:
+  epsilon: 0.2            # §15 ε-greedy (Orca delegation bandit, Stream 3)
+
+phases:
+  phase0_length: 15       # §15 bandit warmup, cards frozen
+  memory_cap: 8           # §15 heuristics/agent
+
+seeds:
+  train: ["A", "T2", "T3"]   # §15 rotate (D7)
+  heldout: ["B", "C"]        # §15 eval only, never trained on (D7)
+
+telemetry:
+  mode: "auto"            # auto | weave | local | off  (auto => weave iff creds)
+  project: "orca"
+  run_dir: "runs"

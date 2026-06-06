@@ -1,0 +1,3 @@
+# Optional telemetry stack. Absent => Orca uses a local-JSONL / no-op logger.
+weave>=0.51
+wandb>=0.16
