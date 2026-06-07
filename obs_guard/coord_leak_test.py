@@ -138,4 +138,79 @@ def test_scanner_catches_bare_integer_coordinate_pair():
     assert scan_for_leaks({"a": "agent_2", "b": "gather 6 logs", "c": "head N"}) == []
 
 
+# --------------------------------------------------------------------------- #
+# Deep-env coverage (Stream 1 E2–E6). The ShallowOracle episode above only ever
+# reaches IRON in the Overworld, so the scanner never sees the NEW deep obs
+# surfaces — Nether/End mobs (piglin/blaze/ender_dragon) and the perceived
+# landmarks (fortress/stronghold/portal/lava_pool). These drive the full-DAG
+# oracle to build a real dragon-defeated world, reveal it, and scan an
+# observation from every region (day + night) so Law 4 (§3.2) is actually
+# enforced on the deepened observation — not just the shallow slice.
+# --------------------------------------------------------------------------- #
+def _deep_snapshots(seed: str = "A"):
+    """``(won, snapshots, surfaces)`` from a fully-explored, dragon-defeated world.
+
+    Plays the full-DAG oracle (so portals are lit and structures/layers are real),
+    marks every region discovered to maximize the perception surface, then walks
+    the agent through every region and serializes via the real ``env.observe``
+    path at a day round and a night round. ``surfaces`` is the set of deep
+    mob/landmark tokens actually produced (used to prove the scan isn't vacuous).
+    """
+    from contracts.enums import TimeOfDay
+    from env.observation import time_of_day
+    from env.oracle import FullDagOracle
+
+    env = StubEnv(seed=seed, agents=[("oracle", Role.TINKERER)], t_max=8000, stop_at_milestone=None)
+    env.reset()
+    won = FullDagOracle("oracle").solve(env)
+    for region in env.world.regions.values():
+        region.discovered = True  # reveal everything so all landmarks/mobs surface
+    agent = env.world.agents["oracle"]
+
+    dl = env.day_length
+    day_r = next(r for r in range(dl) if time_of_day(r, dl) == TimeOfDay.DAY)
+    night_r = next((r for r in range(dl) if time_of_day(r, dl) == TimeOfDay.NIGHT), day_r)
+
+    snapshots, surfaces = [], set()
+    for rid in env.world.regions:
+        agent.region_id = rid
+        for round_idx in (day_r, night_r):
+            env.round_idx = round_idx
+            obs = env.observe("oracle")
+            snapshots.append((rid, round_idx, obs))
+            dumped = obs.model_dump(mode="json", by_alias=True)
+            surfaces.update(("mob", m) for m in dumped["here"]["mobs"])
+            surfaces.update(("landmark", lm["type"]) for lm in dumped["known_landmarks"])
+    return won, snapshots, surfaces
+
+
+def test_deep_world_observations_no_leak():
+    # The deep counterpart to test_full_episode_observations_no_leak: every seed,
+    # every region of a dragon-defeated world, day + night — none may leak (§3.2).
+    from env.seeds import ALL_SEEDS
+
+    scanned = 0
+    for seed in ALL_SEEDS:
+        won, snapshots, _surfaces = _deep_snapshots(seed)
+        assert won, f"oracle did not reach the dragon on seed {seed!r} — cannot scan deep obs"
+        for rid, round_idx, obs in snapshots:
+            assert_no_coord_leak(obs, path=f"{seed}:{rid}@r{round_idx}")
+            scanned += 1
+    assert scanned > 0
+
+
+def test_deep_observation_surfaces_are_actually_exercised():
+    # Negative-space guard: the deep mobs + landmarks the shallow episode never
+    # produces must actually appear in what we scanned — otherwise the no-leak
+    # test above could pass vacuously on empty surfaces.
+    _won, _snapshots, surfaces = _deep_snapshots("A")
+    for surface in (
+        ("mob", "blaze"),          # fortress (Nether)
+        ("mob", "ender_dragon"),   # the End
+        ("landmark", "fortress"),  # structure landmark from a discovered neighbor
+        ("landmark", "portal"),    # a lit nether/end portal seen from a neighbor
+    ):
+        assert surface in surfaces, f"deep surface {surface} not exercised; saw {sorted(surfaces)}"
+
+
 __all__ = ["scan_for_leaks", "assert_no_coord_leak"]
