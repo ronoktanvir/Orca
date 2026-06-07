@@ -1,15 +1,20 @@
 """Trace digest (§6.1) — Stream 3 (O1).
 
-Orca never reads the raw token stream. It reads a *compact, objective digest* of
-one episode: the DAG frontier + milestone timeline, per-agent objective stats
-(subtask progress / invalids / idle / deaths / handoffs / useful messages), and
+Orca does not query Weave or replay the raw token stream. It reads a *compact*
+digest of one episode: the DAG frontier + milestone timeline, per-agent objective
+stats (subtask progress / invalids / idle / deaths / handoffs / useful messages),
 the bottlenecks that explain a stall (longest dead-runs, repeated invalids,
-starvation). This is the input to the verbal coach (§6.4) and to scoring (§7.3),
-and it is what gets logged to Weave (§10).
+starvation), and — so the coach can judge *how* a worker reasoned, not just its
+counts — each worker's own (scrubbed) per-turn reasoning from
+``EpisodeTrace.reasoning_log`` (§6.4). This is the input to the verbal coach
+(§6.4) and to scoring (§7.3), and it is what gets logged to Weave (§10).
 
 The digest is derived **only** from the objective ``EpisodeTrace`` +
 ``EpisodeMetrics`` — never from Orca's own opinion — which is what keeps the
-anti-circularity wall intact (§6.4): the coach reasons over facts, not vibes.
+anti-circularity wall intact (§6.4): the headline ``team_reward`` is untouched, so
+the coach reasons over what the workers actually did and said, not over its own
+prior scores. The reasoning text rides the same coordinate-leak scrub as worker
+messages (§3.2), so it stays transfer-safe on held-out seeds.
 """
 
 from __future__ import annotations
@@ -34,6 +39,28 @@ _PRODUCTIVE = {
     ActionName.GIVE_ITEM,
 }
 
+# How much worker reasoning the coach sees per agent: the most-recent few turns,
+# each truncated, so the prompt stays bounded and cheap (§6.4).
+_REASONING_KEEP = 3
+_REASONING_MAXLEN = 200
+
+
+def _recent_reasoning(trace: EpisodeTrace) -> dict[str, list[str]]:
+    """Map agent_id -> its most-recent (truncated) reasoning snippets (§6.4).
+
+    Reads ``trace.reasoning_log`` (already scrubbed at the run-loop boundary);
+    keeps the last ``_REASONING_KEEP`` per agent so the coach reads what a worker
+    was thinking near the end of the episode, where stalls usually surface."""
+    by_agent: dict[str, list[str]] = {}
+    for rec in getattr(trace, "reasoning_log", None) or []:
+        text = (getattr(rec, "text", "") or "").strip()
+        if not text:
+            continue
+        if len(text) > _REASONING_MAXLEN:
+            text = text[: _REASONING_MAXLEN - 1].rstrip() + "…"
+        by_agent.setdefault(rec.agent_id, []).append(text)
+    return {aid: snippets[-_REASONING_KEEP:] for aid, snippets in by_agent.items()}
+
 
 class AgentDigest(BaseModel):
     """One worker's objective episode summary + its bottleneck flags."""
@@ -55,6 +82,9 @@ class AgentDigest(BaseModel):
     longest_stall: int = 0  # longest run of consecutive non-productive rounds
     top_invalid: tuple[str, str, int] | None = None  # (action, reason, count)
     flags: list[str] = Field(default_factory=list)  # short human-readable notes
+    # The worker LLM's own recent reasoning (scrubbed) — the "why" behind the
+    # numbers, fed to the coach so it judges intent, not just outcomes (§6.4).
+    recent_reasoning: list[str] = Field(default_factory=list)
 
     # Advisory dials (filled by scoring, §7.3) — copied through for logging.
     performance_score: float = 0.0
@@ -114,6 +144,8 @@ class TraceDigest(BaseModel):
             )
             if a.assignment:
                 lines.append(f"      assigned: {a.assignment}")
+            for snippet in a.recent_reasoning:
+                lines.append(f'      reasoned: "{snippet}"')
         if self.bottlenecks:
             lines.append("bottlenecks:")
             for b in self.bottlenecks:
@@ -158,6 +190,7 @@ def build_digest(trace: EpisodeTrace, metrics: EpisodeMetrics) -> TraceDigest:
     """Compress an episode into the objective digest Orca reads (§6.1)."""
     assignments = {c.agent_id: c.assignment for c in trace.behavior_cards}
     handoffs_in = _handoffs_received(trace)
+    reasoning_by = _recent_reasoning(trace)
     msgs_by_agent: Counter[str] = Counter(
         getattr(m, "from_agent", "") for m in trace.messages
     )
@@ -195,6 +228,7 @@ def build_digest(trace: EpisodeTrace, metrics: EpisodeMetrics) -> TraceDigest:
                 longest_stall=longest_stall,
                 top_invalid=top_invalid,
                 flags=flags,
+                recent_reasoning=reasoning_by.get(st.agent_id, []),
                 performance_score=st.performance_score,
                 learning_signal=st.learning_signal,
             )

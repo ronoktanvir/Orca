@@ -37,6 +37,7 @@ from .episode import (
     EpisodeMetrics,
     EpisodeTrace,
     MilestoneEvent,
+    ReasoningRecord,
 )
 from .execution_memory import MEMORY_CAP, ExecutionMemory, Heuristic
 from .message import Message
@@ -80,6 +81,7 @@ __all__ = [
     "ActionRecord",
     "AgentStats",
     "MilestoneEvent",
+    "ReasoningRecord",
     # memory sub-models
     "Heuristic",
     "MEMORY_CAP",

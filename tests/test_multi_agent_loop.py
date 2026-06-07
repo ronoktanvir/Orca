@@ -173,8 +173,11 @@ def test_rejected_proposal_does_not_update_memory(monkeypatch):
 
 def test_accepted_proposal_allows_memory_update(monkeypatch):
     # Invalid-action workers -> a NON-EMPTY heuristic proposal -> accepted gate ->
-    # the memory write runs for every agent.
-    monkeypatch.setattr(loop, "build_llm", lambda role, settings: ConstLLM(_INVALID_JSON))
+    # the memory write runs for every agent. Orca uses the offline heuristic coach
+    # (role -> None) so the proposal is the deterministic execution-fix this asserts.
+    monkeypatch.setattr(
+        loop, "build_llm", lambda role, settings: None if role == "orca" else ConstLLM(_INVALID_JSON)
+    )
 
     calls: list = []
 
@@ -364,7 +367,10 @@ def test_memory_persists_into_next_episode(monkeypatch):
     settings.run.n_episodes = 2
     settings.phases.phase0_length = 0  # coach/gate active from episode 0
     const = ConstLLM(_INVALID_JSON)
-    monkeypatch.setattr(loop, "build_llm", lambda role, settings: const)
+    # Orca on the offline heuristic coach (role -> None); workers on the mock.
+    monkeypatch.setattr(
+        loop, "build_llm", lambda role, settings: None if role == "orca" else const
+    )
 
     loop.run(settings, telemetry=init_telemetry(mode="off"))
 
@@ -393,6 +399,84 @@ def test_should_write_memory_rejects_empty_scored_proposal():
     assert loop._should_write_memory(True, nonempty) is True
     assert loop._should_write_memory(False, nonempty) is False
     assert loop._should_write_memory(True, None) is False
+
+
+# --------------------------------------------------------------------------- #
+# Worker reasoning is threaded onto the trace and into the coach's digest (§6.4).
+# --------------------------------------------------------------------------- #
+def test_worker_reasoning_lands_on_trace_and_digest(monkeypatch):
+    # Each worker's own "reasoning" string should ride the trace (reasoning_log) and
+    # surface in the digest Orca's coach reads — not just live in the Weave event.
+    from orca.digest import build_digest
+
+    monkeypatch.setattr(loop, "build_llm", lambda role, settings: ConstLLM(_WORKER_JSON))
+    settings = _settings(t_max=3)
+    (trace, metrics), = loop.run(settings, telemetry=init_telemetry(mode="off"))
+
+    assert trace.reasoning_log, "worker reasoning should be captured on the trace"
+    assert all(r.agent_id in trace.agent_ids for r in trace.reasoning_log)
+    assert all("scouting outward" in r.text for r in trace.reasoning_log)
+    # Every worker reasons on every turn it acts here, so it mirrors action_records.
+    assert len(trace.reasoning_log) == len(trace.action_records)
+
+    digest = build_digest(trace, metrics)
+    assert any(a.recent_reasoning for a in digest.agents)
+    assert "reasoned:" in digest.render()
+
+
+def test_coord_laden_worker_reasoning_scrubbed_on_trace(monkeypatch):
+    # Reasoning is free text from the model, so it must ride the same coordinate-leak
+    # scrub as messages/args before it can reach Orca (§3.2): a worker that "thinks"
+    # in coordinates must not leak them onto the trace or into the digest.
+    leaky = (
+        '{"reasoning":"iron vein at 12.0, 3.5 near r_07, heading there",'
+        '"action":{"name":"scout"}}'
+    )
+    monkeypatch.setattr(loop, "build_llm", lambda role, settings: ConstLLM(leaky))
+    settings = _settings(t_max=2)
+    (trace, _metrics), = loop.run(settings, telemetry=init_telemetry(mode="off"))
+
+    assert trace.reasoning_log, "reasoning should survive scrubbing (not be all-dropped)"
+    for r in trace.reasoning_log:
+        assert "r_07" not in r.text and "12.0, 3.5" not in r.text
+    assert_no_coord_leak([r.model_dump() for r in trace.reasoning_log], path="reasoning_log")
+
+
+def test_orca_coach_takes_the_llm_path_when_a_model_is_available(monkeypatch):
+    # Part 1: when build_llm provides an Orca model, the coach reasons with the LLM
+    # (source='llm'), not the offline heuristic — Orca's judgement is model-driven.
+    class CoachLLM:
+        def complete(self, prompt, schema=None, **kwargs):
+            return (
+                '{"team_reasoning":"agent_2 lacked the recipe",'
+                '"agents":[{"agent_id":"agent_2","credit":"execution",'
+                '"reasoning":"missing prereq","new_directives":["check prereqs"],'
+                '"learning_signal":0.5}]}'
+            )
+
+    events: list = []
+
+    class CapTel:
+        def log_event(self, name, data):
+            events.append((name, data))
+
+        def log_episode(self, *a, **k):
+            return None
+
+    monkeypatch.setattr(
+        loop,
+        "build_llm",
+        lambda role, settings: CoachLLM() if role == "orca" else ConstLLM(_INVALID_JSON),
+    )
+    monkeypatch.setattr(loop, "AcceptGate", AcceptingGate)
+
+    settings = _settings(t_max=2)
+    settings.phases.phase0_length = 0  # coach active from episode 0
+    loop.run(settings, telemetry=CapTel())
+
+    coach_events = [d for n, d in events if n == "orca_coach"]
+    assert coach_events, "the coach should have run and logged"
+    assert any(d["source"] == "llm" for d in coach_events), "coach should use the LLM path"
 
 
 def test_empty_proposal_with_scores_does_not_write_through_loop(monkeypatch):
@@ -434,7 +518,10 @@ def test_negative_coach_signal_weakens_memory_through_loop(monkeypatch):
     settings.run.n_episodes = 3
     settings.phases.phase0_length = 0
     const = ConstLLM(_INVALID_JSON)  # non-empty proposals so writes are gated-through
-    monkeypatch.setattr(loop, "build_llm", lambda role, settings: const)
+    # Orca on the offline heuristic coach (role -> None); workers on the mock.
+    monkeypatch.setattr(
+        loop, "build_llm", lambda role, settings: None if role == "orca" else const
+    )
 
     loop.run(settings, telemetry=init_telemetry(mode="off"))
 
