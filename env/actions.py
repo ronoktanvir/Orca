@@ -25,14 +25,16 @@ from . import techtree
 from .world import AgentState, World
 
 # Actions still deferred (rejected + validly logged). E1 added SMELT + PLACE; E3
-# adds a minimal deterministic FIGHT (below) so the full-DAG oracle can prove
-# winnability; EAT/SLEEP/GIVE_ITEM/REGROUP land in E4 (survival) / E5 (co-op).
+# a deterministic FIGHT; E4 adds EAT (below). SLEEP/GIVE_ITEM/REGROUP land in E4
+# (sleep) / E5 (co-op).
 _UNSUPPORTED = {
-    ActionName.EAT,
     ActionName.SLEEP,
     ActionName.GIVE_ITEM,
     ActionName.REGROUP,
 }
+
+# Hunger restored per cooked_food eaten (§3.5, E4). EAT consumes one cooked_food.
+_EAT_RESTORE = 0.5
 
 # Mob -> (drop item, location predicate, human reason if location is wrong).
 # E3-minimal: deterministic, single-agent, always-succeeds. E4 adds stochastic
@@ -354,7 +356,19 @@ def resolve_action(
                  result={"defeated": "ender_dragon", "win": True, "n_colocated": n_colocated})
         )
 
-    # --- deferred to E4 (survival) / E5 (co-op) --------------------------- #
+    # --- eat (E4: restore hunger by consuming cooked_food; §3.5) ------------ #
+    if name == ActionName.EAT:
+        if agent.inventory.get("cooked_food", 0) <= 0:
+            return Resolution(_rec(round_idx, agent, action, False, "no cooked_food to eat"))
+        agent.inventory["cooked_food"] -= 1
+        if agent.inventory["cooked_food"] <= 0:
+            del agent.inventory["cooked_food"]
+        agent.hunger = min(1.0, agent.hunger + _EAT_RESTORE)
+        return Resolution(
+            _rec(round_idx, agent, action, True, result={"ate": "cooked_food", "hunger": agent.hunger})
+        )
+
+    # --- deferred to E4 (sleep) / E5 (co-op) ------------------------------ #
     if name in _UNSUPPORTED:
         return Resolution(
             _rec(round_idx, agent, action, False, f"action '{name.value}' not supported in stub env")

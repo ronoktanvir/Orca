@@ -39,6 +39,25 @@ def _depth(m: Milestone) -> int:
     return _MILESTONE_ORDER.index(m)
 
 
+# E4 survival (§3.5). Hunger drains each round (faster when moving/fighting); at 0
+# hunger, health drains; at 0 health the agent dies, drops non-equipped inventory,
+# and respawns at the start region after a cost. Rates are deliberately gentle so a
+# competent agent (the scripted oracle, ~hundreds of rounds) survives without eating
+# — death is reachable for an agent that neglects food, and is forced in tests.
+# Tunable upward later. All draws go through the seeded RNG (deterministic).
+_HUNGER_DRAIN_IDLE = 0.0004
+_HUNGER_DRAIN_ACTIVE = 0.0008  # moving / fighting costs more (§3.5)
+_HEALTH_DRAIN_STARVING = 0.05  # per round while hunger is 0
+_RESPAWN_COST = 5  # rounds dead before respawning at the start region
+_ACTIVE_ACTIONS = {ActionName.MOVE, ActionName.FIGHT}
+# Equipped gear survives death; raw resources + consumables are dropped (§3.5).
+_EQUIPPED_KEEP = {
+    "wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond_pickaxe",
+    "stone_sword", "iron_sword", "diamond_sword", "diamond_armor", "shield",
+    "bucket", "flint_and_steel",
+}
+
+
 @dataclass
 class StepResult:
     """What one synchronous round produced."""
@@ -140,6 +159,32 @@ class StubEnv:
         return posted
 
     # ------------------------------------------------------------------ #
+    def _survival_tick(self, agent: AgentState, action, rng) -> None:
+        """Advance one round of hunger/health/death/respawn for one agent (§3.5)."""
+        if not agent.alive:
+            agent.busy_rounds -= 1  # respawn countdown
+            if agent.busy_rounds <= 0:
+                agent.alive = True
+                agent.health = 1.0
+                agent.hunger = 1.0
+                agent.busy_rounds = 0
+                agent.region_id = self.world.start_region_id
+            return
+        active = action is not None and getattr(action, "name", None) in _ACTIVE_ACTIONS
+        base = _HUNGER_DRAIN_ACTIVE if active else _HUNGER_DRAIN_IDLE
+        agent.hunger = max(0.0, agent.hunger - base * (0.8 + 0.4 * rng.random()))
+        if agent.hunger <= 0.0:
+            agent.health = max(0.0, agent.health - _HEALTH_DRAIN_STARVING)
+            if agent.health <= 0.0:
+                agent.alive = False
+                agent.deaths += 1
+                agent.busy_rounds = _RESPAWN_COST
+                # Drop non-equipped inventory; keep equipped gear (§3.5).
+                agent.inventory = {
+                    k: v for k, v in agent.inventory.items() if k in _EQUIPPED_KEEP
+                }
+
+    # ------------------------------------------------------------------ #
     @property
     def done(self) -> bool:
         if self._terminated_reason is not None:
@@ -189,6 +234,12 @@ class StubEnv:
                 self._posted.append(res.message)
                 self.all_messages.append(res.message)
                 result.messages.append(res.message)
+
+        # Survival tick: hunger/health/death/respawn for every agent (§3.5, E4).
+        for aid in self.agent_ids:
+            agent = self.world.agents[aid]
+            srng = make_rng(self.seed, self.episode_idx, self.round_idx, aid + ":survival")
+            self._survival_tick(agent, actions.get(aid), srng)
 
         # Update the (monotonic) max team frontier and timeline.
         detected = techtree.detect_frontier(
