@@ -285,9 +285,19 @@ def resolve_action(
 
     # --- place (deploy a block / light a portal into the world; §3.1, §3.4) - #
     if name == ActionName.PLACE:
-        item = str(args.get("item", args.get("block", "")))
+        item = techtree.canonical_item(str(args.get("item", args.get("block", ""))))
         if not item:
             return Resolution(_rec(round_idx, agent, action, False, "place needs an item"))
+
+        # crafting_table / furnace are inventory-only prerequisites (non-consumed,
+        # non-geometric ``requires`` gates). LLM workers habitually try to ``place``
+        # them out of Minecraft habit; treat that as a no-op success when one is on
+        # hand so the turn isn't wasted (crafting/smelting already work from the
+        # inventory copy). Missing one is still an honest rejection (§3.4).
+        if item in ("crafting_table", "furnace"):
+            if agent.inventory.get(item, 0) <= 0:
+                return Resolution(_rec(round_idx, agent, action, False, f"no {item} to place"))
+            return Resolution(_rec(round_idx, agent, action, True, result={"placed": item, "noop": True}))
 
         # Lighting a nether portal links this Overworld region to the Nether entry.
         if item == "nether_portal":

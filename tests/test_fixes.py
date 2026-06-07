@@ -66,6 +66,24 @@ def test_valid_action_marked_ok_next_obs():
     assert la is not None and la.valid is True
 
 
+# --- 2b. place crafting_table/furnace is a no-op success ------------------ #
+def test_place_crafting_table_is_noop_success():
+    env = StubEnv(seed="A", agents=[("agent_1", Role.MINER)])
+    env.reset()
+    env.world.agents["agent_1"].inventory["crafting_table"] = 1
+    res = env.step({"agent_1": Action(name=ActionName.PLACE, args={"item": "crafting_table"})})
+    assert res.records[0].valid
+    # not consumed — still present for crafting/smelting afterward
+    assert env.world.agents["agent_1"].inventory.get("crafting_table", 0) == 1
+
+
+def test_place_table_alias_without_one_is_rejected():
+    env = StubEnv(seed="A", agents=[("agent_1", Role.MINER)])
+    env.reset()
+    res = env.step({"agent_1": Action(name=ActionName.PLACE, args={"item": "table"})})  # alias
+    assert not res.records[0].valid and "crafting_table" in (res.records[0].reason or "")
+
+
 # --- 3. named roster / recipient allow-list ------------------------------- #
 def test_named_recipients_not_downgraded():
     for name in NAME_BY_ROLE.values():

@@ -390,7 +390,7 @@ def test_clean_nested_args_preserved_and_leak_free():
 
 def test_prompt_action_arg_specs_match_build_spec():
     prompt = build_worker_prompt(sample_observation(), sample_behavior_card(), sample_execution_memory())
-    assert 'place: args: {"item": "<item>"}' in prompt
+    assert 'place: args: {"item": "<block>"}' in prompt
     assert 'give_item: args: {"agent": "agent_k", "item": "<name>", "n": <int>}' in prompt
     assert 'regroup: args: {"agent": "agent_k"}' in prompt
     assert 'place: args: {"structure": "<name>"}' not in prompt  # old, wrong place spec gone
