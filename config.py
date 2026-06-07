@@ -7,6 +7,7 @@ Adding a *new* knob is additive; renaming/removing is a broadcast change.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -15,12 +16,37 @@ from pydantic import BaseModel, Field
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "default.yaml"
+DEFAULT_ENV_PATH = REPO_ROOT / ".env"
+
+
+def load_dotenv(path: str | Path | None = None) -> list[str]:
+    """Load KEY=VALUE pairs from a gitignored ``.env`` into ``os.environ``.
+
+    Minimal, dependency-free. Never overrides a variable already set in the
+    shell. Returns the list of keys it set (values never logged). Secrets stay
+    out of the repo: the real ``.env`` is gitignored; ``.env.example`` documents
+    the keys (OPENAI_API_KEY, WANDB_API_KEY, WANDB_INFERENCE_API_KEY, ...).
+    """
+    path = Path(path) if path else DEFAULT_ENV_PATH
+    if not path.exists():
+        return []
+    set_keys: list[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+            set_keys.append(key)
+    return set_keys
 
 
 class RunConfig(BaseModel):
     seed: str = "A"
     n_episodes: int = 1
-    t_max: int = 600
+    t_max: int = 120
     day_length: int = 100
     stop_at_milestone: Optional[str] = "iron"  # Phase 0 shallow target
     message_window: int = 8
@@ -77,4 +103,11 @@ def load_config(path: str | Path | None = None) -> OrcaSettings:
     return OrcaSettings(**data)
 
 
-__all__ = ["OrcaSettings", "load_config", "DEFAULT_CONFIG_PATH", "REPO_ROOT"]
+__all__ = [
+    "OrcaSettings",
+    "load_config",
+    "load_dotenv",
+    "DEFAULT_CONFIG_PATH",
+    "DEFAULT_ENV_PATH",
+    "REPO_ROOT",
+]

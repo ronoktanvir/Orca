@@ -4,7 +4,8 @@
 run:
   seed: "A"               # which seed layout to run (train pool {A,T2,T3})
   n_episodes: 1           # Phase 0: a single end-to-end episode
-  t_max: 600              # §15 rounds/episode cap
+  t_max: 120              # episode cap — lowered for early streams to keep LLM
+                          # episodes short/cheap (§8); raise as agents get competent
   day_length: 100         # §15 night-danger cadence (time_of_day in obs)
   stop_at_milestone: "iron"  # Phase 0 shallow target; null => run to t_max
   message_window: 8       # §5.2 recent_messages K

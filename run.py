@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from config import load_config
+from config import load_config, load_dotenv
 from telemetry import init_telemetry
 from train.loop import run
 
@@ -37,6 +37,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv()  # pull .env secrets (OPENAI/WANDB keys) into the environment
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     settings = load_config(args.config)
     if args.seed is not None:

@@ -13,7 +13,7 @@ def test_load_default_config():
     cfg = load_config()
     assert isinstance(cfg, OrcaSettings)
     assert cfg.run.seed == "A"
-    assert cfg.run.t_max == 600
+    assert cfg.run.t_max == 120
     assert cfg.run.day_length == 100
     assert cfg.reward.weights == {"deaths": 0.02, "invalid": 0.05, "idle": 0.05}
     assert cfg.bandit.epsilon == 0.2
@@ -34,4 +34,4 @@ def test_partial_config_merges_defaults(tmp_path):
     cfg = load_config(p)
     assert cfg.run.seed == "T2"
     assert cfg.run.n_episodes == 3
-    assert cfg.run.t_max == 600  # default preserved
+    assert cfg.run.t_max == 120  # default preserved

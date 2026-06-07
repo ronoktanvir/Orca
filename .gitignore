@@ -23,5 +23,13 @@ runs/
 wandb/
 *.local.yaml
 
+# Secrets — NEVER commit. Real keys live in .env (gitignored); .env.example is a
+# committed placeholder. W&B tracing key also lives in ~/.netrc (outside repo).
+.env
+.env.*
+!.env.example
+*.key
+secrets.*
+
 # OS
 .DS_Store
