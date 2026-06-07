@@ -18,8 +18,9 @@ env/.venv/
 .coverage
 htmlcov/
 
-# Orca run artifacts (local telemetry fallback, checkpoints)
+# Orca run artifacts (local telemetry fallback, checkpoints, generated figures)
 runs/
+figures/
 wandb/
 *.local.yaml
 
