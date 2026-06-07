@@ -15,8 +15,9 @@ The faithful §8 training loop, with the real Architecture-C2 manager wired in:
 The offline fallback is preserved (Green-main law): with ``single_agent_oracle``
 (the default) the loop uses the scripted oracle + :class:`NoOpOrca`, so ``python
 run.py`` and ``pytest`` run with no LLM and no network. The full team path uses
-the real :class:`Orca` and the same scripted oracle as a stand-in until Stream 2's
-``LLMWorker`` is swapped in via ``worker_factory``.
+the real :class:`Orca`; after Stream 2, its default worker implementation is
+``LLMWorker`` when a worker LLM is provided, while the explicit ``worker_factory``
+seam remains available for tests, RealRunner swaps, and offline mocks.
 """
 
 from __future__ import annotations
@@ -25,10 +26,13 @@ from statistics import median
 from typing import Callable, Optional
 
 from agents.scripted import ShallowOracle
+from agents.worker import LLMWorker
+from bus import CommBus
 from config import OrcaSettings, load_config
-from contracts import EpisodeMetrics, EpisodeTrace
+from contracts import EpisodeMetrics, EpisodeTrace, ExecutionMemory, Message, Observation
 from contracts.enums import Milestone, Role
 from env import StubEnv
+from llm import build_llm
 from orca import DEFAULT_ROSTER, AcceptGate, NoOpOrca, Orca
 from orca.orca import OrcaConfig
 from reward import reward_computer
@@ -53,19 +57,42 @@ def env_step(env: StubEnv, actions: dict):
     return env.step(actions)
 
 
-def _round_actions(
-    agents: list, env: StubEnv, obs_snapshots: list[dict], telemetry: Telemetry, concurrency: int
-) -> dict:
-    """Collect one round's actions. Observe is sequential (reads world state);
-    the worker LLM calls run concurrently across agents when ``concurrency > 1``.
+def _merge_bus_messages(
+    obs: Observation, bus: CommBus, agent_id: str, window: int
+) -> Observation:
+    """Fold bus deliveries for ``agent_id`` into ``obs.recent_messages`` (§5.2)."""
+    extra = bus.recent_for(agent_id)
+    if not extra:
+        return obs
+    combined = (list(obs.recent_messages) + list(extra))[-window:]
+    return obs.model_copy(update={"recent_messages": combined})
 
-    The actions/snapshots/logs are assembled in fixed agent order regardless of
-    thread completion, so results stay deterministic. Note: under threading the
-    per-call ``@op`` Weave spans don't nest under the round (a known thread-context
-    limitation); the default ``concurrency=1`` keeps the trace tree intact."""
+
+def _round_actions(
+    agents: list,
+    env: StubEnv,
+    obs_snapshots: list[dict],
+    telemetry: Telemetry,
+    concurrency: int,
+    *,
+    bus: Optional[CommBus] = None,
+    bus_messages: Optional[list[Message]] = None,
+) -> dict:
+    """Collect one round's actions.
+
+    Observation is sequential (reads world state); worker calls can run
+    concurrently across agents when ``concurrency > 1``. If a comm bus is present,
+    messages posted last round are delivered before observation, and this round's
+    worker-emitted messages are posted for t+1 delivery.
+    """
+    if bus is not None:
+        bus.tick()
+
     obs_by = []
     for agent in agents:
         obs = env.observe(agent.agent_id)
+        if bus is not None:
+            obs = _merge_bus_messages(obs, bus, agent.agent_id, env.message_window)
         obs_snapshots.append(obs.model_dump(mode="json", by_alias=True))
         obs_by.append((agent, obs))
 
@@ -92,6 +119,15 @@ def _round_actions(
                 "args": action.args,
             },
         )
+
+    if bus is not None:
+        for agent, _obs in obs_by:
+            for msg in getattr(agent, "pending_messages", []) or []:
+                bus.post(msg)
+                if bus_messages is not None:
+                    bus_messages.append(msg)
+                telemetry.log_event("message", msg.model_dump(by_alias=True))
+
     return actions
 
 
@@ -105,14 +141,24 @@ def run_episode(
     telemetry: Telemetry,
     settings: OrcaSettings,
     baseline_steps: Optional[int] = None,
+    bus: Optional[CommBus] = None,
 ) -> tuple[EpisodeTrace, EpisodeMetrics]:
     """Run one full episode end-to-end; emit EpisodeTrace + EpisodeMetrics (§8)."""
     env.reset()
     obs_snapshots: list[dict] = []
+    bus_messages: list[Message] = []
     concurrency = getattr(settings.run, "worker_concurrency", 1)
 
     while not env.done:
-        actions = _round_actions(agents, env, obs_snapshots, telemetry, concurrency)
+        actions = _round_actions(
+            agents,
+            env,
+            obs_snapshots,
+            telemetry,
+            concurrency,
+            bus=bus,
+            bus_messages=bus_messages,
+        )
         env_step(env, actions)
 
     trace = EpisodeTrace(
@@ -126,7 +172,7 @@ def run_episode(
         },
         behavior_cards=list(orca_config.behavior_cards.values()),
         action_records=list(env.all_records),
-        messages=list(env.all_messages),
+        messages=list(env.all_messages) + bus_messages,
         milestone_timeline=list(env.milestone_timeline),
         frontier_reached=env.frontier,
         terminated_reason=env.terminated_reason,
@@ -148,6 +194,49 @@ def _parse_milestone(value: Optional[str]) -> Optional[Milestone]:
     return Milestone(value)
 
 
+def _episode_digest(trace: EpisodeTrace, metrics: EpisodeMetrics) -> str:
+    """A compact, coordinate-free episode summary for memory writes (§4.5)."""
+    lines = [
+        f"frontier={metrics.frontier_milestone.value} reward={metrics.team_reward:.3f} "
+        f"rounds={metrics.n_rounds} reason={trace.terminated_reason}"
+    ]
+    for st in metrics.agent_stats:
+        lines.append(
+            f"{st.agent_id}({st.role.value}): actions={st.actions_taken} "
+            f"invalid={st.invalid_actions} idle={st.idle_rounds} "
+            f"gathered={st.items_gathered} crafted={st.items_crafted}"
+        )
+    return "\n".join(lines)
+
+
+def _learning_signal_for(metrics: EpisodeMetrics, agent_id: str) -> float:
+    for st in metrics.agent_stats:
+        if st.agent_id == agent_id:
+            return st.learning_signal
+    return 0.0
+
+
+def _update_execution_memories(
+    agents: list,
+    memories: dict[str, ExecutionMemory],
+    trace: EpisodeTrace,
+    metrics: EpisodeMetrics,
+) -> None:
+    """Persist agent-owned memory writes after an accepted update (§4.5, §6.5)."""
+    if not memories:
+        return
+    digest = _episode_digest(trace, metrics)
+    for agent in agents:
+        update = getattr(agent, "end_episode_update", None)
+        if update is None:
+            continue
+        ls = _learning_signal_for(metrics, agent.agent_id)
+        update(digest, ls)
+        memory = getattr(agent, "memory", None)
+        if isinstance(memory, ExecutionMemory):
+            memories[agent.agent_id] = memory
+
+
 # --------------------------------------------------------------------------- #
 # Building blocks shared by the loop and the eval harness (O7).
 # --------------------------------------------------------------------------- #
@@ -156,15 +245,33 @@ def build_agents(
     *,
     llm=None,
     worker_factory: Optional[Callable] = None,
+    behavior_cards: Optional[dict] = None,
+    memories: Optional[dict[str, ExecutionMemory]] = None,
+    telemetry: Optional[Telemetry] = None,
 ) -> list:
-    """Construct the worker objects for a roster.
+    """Construct worker objects for a roster.
 
-    Default: the scripted :class:`ShallowOracle` (offline, role-independent).
-    ``worker_factory(agent_id, role, llm)`` is the Stream 2 seam to swap in the
-    real ``LLMWorker`` without the loop changing.
+    Default with no ``llm``: the scripted :class:`ShallowOracle` (offline).
+    Default with ``llm``: Stream 2's :class:`LLMWorker`.
+    ``worker_factory(agent_id, role, llm)`` remains the explicit seam for tests,
+    RealRunner swaps, and custom worker implementations.
     """
     if worker_factory is not None:
         return [worker_factory(aid, role, llm) for aid, role in roster]
+    if llm is not None:
+        behavior_cards = behavior_cards or {}
+        memories = memories or {}
+        logger = telemetry.log_event if telemetry is not None else None
+        return [
+            LLMWorker(
+                aid,
+                llm,
+                behavior_cards.get(aid),
+                memories.get(aid, ExecutionMemory(agent_id=aid)),
+                logger=logger,
+            )
+            for aid, _role in roster
+        ]
     return [ShallowOracle(aid) for aid, _role in roster]
 
 
@@ -195,18 +302,27 @@ def play_episode(
     worker_factory: Optional[Callable] = None,
     greedy: bool = False,
     baseline_steps: Optional[int] = None,
+    memories: Optional[dict[str, ExecutionMemory]] = None,
+    agent_sink: Optional[list] = None,
+    enable_bus: bool = False,
 ) -> tuple[OrcaConfig, EpisodeTrace, EpisodeMetrics]:
-    """Choose a config, run one episode, and fill the advisory dials (§7.3).
-
-    ``greedy`` (Orca only) selects the best learned arms with no exploration — for
-    held-out eval and gate batches. Works for both ``Orca`` and ``NoOpOrca``.
-    """
+    """Choose a config, run one episode, and fill advisory dials (§7.3)."""
     try:
         config = orca.choose_config(None, greedy=greedy)
     except TypeError:
         config = orca.choose_config(None)
-    agents = build_agents(config.roster, llm=llm, worker_factory=worker_factory)
+    agents = build_agents(
+        config.roster,
+        llm=llm,
+        worker_factory=worker_factory,
+        behavior_cards=config.behavior_cards,
+        memories=memories,
+        telemetry=telemetry,
+    )
+    if agent_sink is not None:
+        agent_sink[:] = agents
     env = make_env(seed, config, settings, stop_at)
+    bus = CommBus(window=settings.run.message_window) if enable_bus else None
     trace, metrics = run_episode(
         env,
         agents,
@@ -215,6 +331,7 @@ def play_episode(
         telemetry=telemetry,
         settings=settings,
         baseline_steps=baseline_steps,
+        bus=bus,
     )
     if isinstance(orca, Orca):
         metrics = orca.objective_scores(metrics)
@@ -244,6 +361,7 @@ def _gate_eval_batch(
             llm=llm,
             worker_factory=worker_factory,
             greedy=True,
+            enable_bus=llm is not None,
         )
         out.append(metrics)
     return out
@@ -263,7 +381,8 @@ def run(
 
     Default (``single_agent_oracle``): the offline smoke — scripted oracle +
     :class:`NoOpOrca`. Full team: the real :class:`Orca` with bandit + (phased)
-    coach + accept-gate and rotated train seeds.
+    coach + accept-gate and rotated train seeds. When no explicit
+    ``worker_factory`` is supplied, the full team uses Stream 2's ``LLMWorker``.
     """
     settings = settings or load_config(config_path)
     telemetry = telemetry or init_telemetry(
@@ -274,7 +393,10 @@ def run(
     )
     stop_at = _parse_milestone(settings.run.stop_at_milestone)
 
-    if settings.run.single_agent_oracle:
+    use_oracle = settings.run.single_agent_oracle
+    worker_llm = llm
+    memories: dict[str, ExecutionMemory] = {}
+    if use_oracle:
         roster: list[tuple[str, Role]] = [("agent_1", Role.MINER)]
         orca = orca or NoOpOrca(roster)
     else:
@@ -286,6 +408,9 @@ def run(
             seed=0,
             telemetry=telemetry,
         )
+        if worker_factory is None:
+            worker_llm = build_llm("worker", settings)
+            memories = {aid: ExecutionMemory(agent_id=aid) for aid, _role in roster}
     real = isinstance(orca, Orca)
 
     train_seeds = settings.seeds.train or [settings.run.seed]
@@ -310,6 +435,7 @@ def run(
         if real:
             orca.enable_coach = phase >= Phase.PHASE_1
 
+        episode_agents: list = []
         config, trace, metrics = play_episode(
             orca,
             seed,
@@ -317,9 +443,12 @@ def run(
             episode_idx=ep,
             telemetry=telemetry,
             stop_at=stop_at,
-            llm=llm,
+            llm=worker_llm,
             worker_factory=worker_factory,
             baseline_steps=baseline_steps if phase >= Phase.PHASE_2 else None,
+            memories=memories,
+            agent_sink=episode_agents,
+            enable_bus=not use_oracle,
         )
 
         # Phase 2 (§6.6/§7.4): activate the speed-reward baseline only after a win.
@@ -331,13 +460,14 @@ def run(
 
         orca.observe_outcome(config, metrics)  # bandit update (no-op for NoOpOrca)
 
+        memory_update_accepted = True
         if real and orca.enable_coach:
             if gate is None:  # bar to beat = what bandit-only achieved in Phase 0
                 prior = [m.team_reward for _s, _c, m in history]
                 base = sum(prior) / len(prior) if prior else 0.0
                 gate = AcceptGate(epsilon=GATE_EPSILON, baseline=base)
             proposal = op(orca.coach)(trace, metrics)
-            gate.evaluate(
+            decision = gate.evaluate(
                 orca,
                 proposal,
                 lambda: _gate_eval_batch(
@@ -346,11 +476,15 @@ def run(
                     gate_seeds,
                     stop_at=stop_at,
                     telemetry=telemetry,
-                    llm=llm,
+                    llm=worker_llm,
                     worker_factory=worker_factory,
                 ),
                 telemetry=telemetry,
             )
+            memory_update_accepted = decision.accepted
+
+        if memory_update_accepted:
+            _update_execution_memories(episode_agents, memories, trace, metrics)
 
         telemetry.log_episode(trace, metrics)
         history.append((seed, config, metrics))
