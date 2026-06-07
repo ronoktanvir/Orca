@@ -61,8 +61,10 @@ def test_validity_rejection_move_toward_nothing():
 
 
 def test_unsupported_action_rejected():
+    # GIVE_ITEM stays deferred to E5 (co-op) and must still reject with "not supported".
+    # (SMELT/PLACE are E1; FIGHT is E3; EAT is E4 — all implemented + tested elsewhere.)
     env = _fresh_env()
-    res = env.step({"agent_1": Action(name=ActionName.SMELT, args={"item": "iron_ingot"})})
+    res = env.step({"agent_1": Action(name=ActionName.GIVE_ITEM, args={"agent": "agent_2", "item": "wood"})})
     assert res.records[0].valid is False
     assert "not supported" in (res.records[0].reason or "")
 
@@ -86,9 +88,19 @@ def test_determinism_same_seed_same_outcome():
     assert gather_total("A") == gather_total("A")  # reproducible
 
 
-def test_world_has_five_regions():
+def test_world_has_full_multilayer_graph():
+    # E2 grew the 5-node stub into a full multi-layer graph (§3.1/§3.7):
+    # 24 Overworld + 10 Nether + 1 End.
     world = make_world("A")
-    assert len(world.regions) == 5
+    from contracts.enums import Layer
+
+    by_layer = {lyr: 0 for lyr in Layer}
+    for region in world.regions.values():
+        by_layer[region.layer] += 1
+    assert by_layer[Layer.OVERWORLD] == 24
+    assert by_layer[Layer.NETHER] == 10
+    assert by_layer[Layer.END] == 1
+    assert len(world.regions) == 35
 
 
 def test_exits_hide_biome_until_discovered():
