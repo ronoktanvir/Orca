@@ -145,8 +145,24 @@ class _Solver:
     def place(self, item: str) -> bool:
         return self._act(Action(name=ActionName.PLACE, args={"item": item}))
 
-    def fight(self, target: str, times: int = 1) -> bool:
-        return all(self._act(Action(name=ActionName.FIGHT, args={"target": target})) for _ in range(times))
+    def fight_until(self, target: str, drop_item: str, n: int, cap: int = 600) -> bool:
+        """Fight ``target`` until the team holds ``n`` of ``drop_item``. Blaze fights
+        are superadditive (§3.5) so a solo prover just retries failed attempts;
+        a co-located team would clear them far faster (that's why delegation pays)."""
+        for _ in range(cap):
+            if self._inv.get(drop_item, 0) >= n:
+                return True
+            if not self._act(Action(name=ActionName.FIGHT, args={"target": target})):
+                return False  # invalid (wrong location) — should not happen
+        return self._inv.get(drop_item, 0) >= n
+
+    def fight_dragon(self, cap: int = 600) -> bool:
+        for _ in range(cap):
+            if self._won():
+                return True
+            if not self._act(Action(name=ActionName.FIGHT, args={"target": "ender_dragon"})):
+                return False
+        return self._won()
 
     def portal(self, to_layer: str) -> bool:
         return self._act(Action(name=ActionName.MOVE, args={"to": to_layer}))
@@ -195,8 +211,8 @@ class _Solver:
             return False
         # 6 blaze rods -> 12 blaze powder; 12 ender pearls; 12 eyes of ender.
         return (
-            self.fight("blaze", 6)
-            and self.fight("enderman", 12)
+            self.fight_until("blaze", "blaze_rod", 6)
+            and self.fight_until("enderman", "ender_pearl", 12)
             and self.craft("blaze_powder", 6)
             and self.craft("eye_of_ender", 12)
         )
@@ -211,7 +227,7 @@ class _Solver:
             self.craft("end_portal")
             and self.place("end_portal")
             and self.portal("end")
-            and self.fight("ender_dragon")
+            and self.fight_dragon()
         )
 
     def run(self) -> bool:

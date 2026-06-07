@@ -48,6 +48,28 @@ def _fight_enderman_ok(region) -> bool:
 def _fight_dragon_ok(region) -> bool:
     return region.layer == Layer.END
 
+
+# Superadditive combat (§3.5, E5): for blaze + the ender_dragon, success rises
+# with the number of co-located teammates — solo is unreliable (~0.2), a co-located
+# trio wins reliably (~0.85). This is THE cooperation incentive ("send a pair to
+# the fortress / bring the team to the End"), so delegation matters. Endermen are
+# a regular mob (deterministic). E4 will fold in gear/health terms; here it is a
+# simple linear curve drawn from the existing seeded RNG (deterministic + logged).
+_SUPERADDITIVE_TARGETS = {"blaze", "ender_dragon", "dragon"}
+_FIGHT_SOLO_P = 0.2  # solo success
+_FIGHT_ALLY_GAIN = 0.325  # per extra co-located ally: solo .20 -> pair .525 -> trio .85
+
+
+def _n_colocated(world: World, agent: AgentState) -> int:
+    """Alive agents sharing the agent's region (SAME_REGION), including itself."""
+    rid = agent.region_id
+    return sum(1 for a in world.agents.values() if a.alive and a.region_id == rid)
+
+
+def _fight_success_p(n_colocated: int) -> float:
+    return max(0.05, min(0.95, _FIGHT_SOLO_P + _FIGHT_ALLY_GAIN * (n_colocated - 1)))
+
+
 # Macro-actions that count as "idle" for the idle-fraction penalty (§7.2).
 IDLE_ACTIONS = {ActionName.WAIT}
 
@@ -284,31 +306,53 @@ def resolve_action(
         # TODO E2+: track placed frame blocks in region world-state (count to 10).
         return Resolution(_rec(round_idx, agent, action, True, result={"placed": item}))
 
-    # --- fight (E3-minimal: deterministic; E4 adds risk, E5 superadditive) -- #
+    # --- fight (E5: superadditive co-op for blaze/dragon; §3.5) ------------- #
     if name == ActionName.FIGHT:
         target = str(args.get("target", args.get("mob", ""))).lower()
+
+        # 1) Location gating — reject (invalid + reason) if the target isn't here.
         if target == "blaze":
             if not _fight_blaze_ok(region):
                 return Resolution(_rec(round_idx, agent, action, False, "blaze are only in a fortress"))
-            agent.inventory["blaze_rod"] = agent.inventory.get("blaze_rod", 0) + 1
-            return Resolution(
-                _rec(round_idx, agent, action, True, result={"defeated": "blaze", "drop": {"blaze_rod": 1}})
-            )
-        if target == "enderman":
+        elif target == "enderman":
             if not _fight_enderman_ok(region):
                 return Resolution(_rec(round_idx, agent, action, False, "no enderman here"))
-            agent.inventory["ender_pearl"] = agent.inventory.get("ender_pearl", 0) + 1
-            return Resolution(
-                _rec(round_idx, agent, action, True, result={"defeated": "enderman", "drop": {"ender_pearl": 1}})
-            )
-        if target in ("ender_dragon", "dragon"):
+        elif target in ("ender_dragon", "dragon"):
             if not _fight_dragon_ok(region):
                 return Resolution(_rec(round_idx, agent, action, False, "the dragon is only in the End"))
-            world.world_milestones.add(Milestone.DRAGON_DEFEATED)
+        else:
+            return Resolution(_rec(round_idx, agent, action, False, f"cannot fight '{target or '?'}'"))
+
+        # 2) Success model. Blaze + dragon are SUPERADDITIVE: a valid attempt may
+        #    fail (solo ~0.2, trio ~0.85) — co-location decides it. A failed attempt
+        #    is still a *valid* action (no drop), not an invalid one.
+        n_colocated = _n_colocated(world, agent)
+        if target in _SUPERADDITIVE_TARGETS:
+            if rng.random() >= _fight_success_p(n_colocated):
+                return Resolution(
+                    _rec(round_idx, agent, action, True,
+                         result={"target": target, "defeated": False, "n_colocated": n_colocated})
+                )
+
+        # 3) Success -> drop / win.
+        if target == "blaze":
+            agent.inventory["blaze_rod"] = agent.inventory.get("blaze_rod", 0) + 1
             return Resolution(
-                _rec(round_idx, agent, action, True, result={"defeated": "ender_dragon", "win": True})
+                _rec(round_idx, agent, action, True,
+                     result={"defeated": "blaze", "drop": {"blaze_rod": 1}, "n_colocated": n_colocated})
             )
-        return Resolution(_rec(round_idx, agent, action, False, f"cannot fight '{target or '?'}'"))
+        if target == "enderman":
+            agent.inventory["ender_pearl"] = agent.inventory.get("ender_pearl", 0) + 1
+            return Resolution(
+                _rec(round_idx, agent, action, True,
+                     result={"defeated": "enderman", "drop": {"ender_pearl": 1}})
+            )
+        # ender_dragon
+        world.world_milestones.add(Milestone.DRAGON_DEFEATED)
+        return Resolution(
+            _rec(round_idx, agent, action, True,
+                 result={"defeated": "ender_dragon", "win": True, "n_colocated": n_colocated})
+        )
 
     # --- deferred to E4 (survival) / E5 (co-op) --------------------------- #
     if name in _UNSUPPORTED:
