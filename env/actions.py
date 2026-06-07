@@ -7,9 +7,9 @@ as ``invalid_action`` with a reason** (§3.3). Invalid-action rate is a tracked
 metric (§7.2, §10).
 
 Phase 0 implemented the shallow action set the oracle needs — move, scout,
-gather, craft, wait, report/request_help. Stream 1 E1 adds ``smelt`` and
-``place`` (below); ``fight``/``eat``/``sleep``/``give_item``/``regroup`` stay
-gracefully rejected until E4 (survival) / E5 (co-op).
+gather, craft, wait, report/request_help. Stream 1 deepens it: E1 added
+smelt/place, E3 fight, E4 eat/sleep (a safe sleep marks SHELTER), and E5 the
+co-op handoffs give_item/regroup (co-location gated). The full §3.3 menu resolves.
 """
 
 from __future__ import annotations
@@ -24,17 +24,12 @@ from contracts.enums import ActionName, Bearing, Biome, Layer, Milestone, Messag
 from . import techtree
 from .world import AgentState, World
 
-# Actions still deferred (rejected + validly logged). E1 added SMELT + PLACE; E3
-# a deterministic FIGHT; E4 adds EAT (below). SLEEP/GIVE_ITEM/REGROUP land in E4
-# (sleep) / E5 (co-op).
-_UNSUPPORTED = {
-    ActionName.SLEEP,
-    ActionName.GIVE_ITEM,
-    ActionName.REGROUP,
-}
-
 # Hunger restored per cooked_food eaten (§3.5, E4). EAT consumes one cooked_food.
 _EAT_RESTORE = 0.5
+
+# Health restored by a safe SLEEP (§3.3). A safe sleep also marks the SHELTER
+# milestone — holding a safe place to rest through the night is the proof of shelter.
+_SLEEP_HEALTH_RESTORE = 0.5
 
 # Mob -> (drop item, location predicate, human reason if location is wrong).
 # E3-minimal: deterministic, single-agent, always-succeeds. E4 adds stochastic
@@ -49,6 +44,14 @@ def _fight_enderman_ok(region) -> bool:
 
 def _fight_dragon_ok(region) -> bool:
     return region.layer == Layer.END
+
+
+def _sleep_safe(region) -> bool:
+    """Safe to sleep here — no hostile mobs (§3.3). The always-hostile places are
+    the Nether, the End, and any fortress; the peaceful Overworld is safe. (Open-
+    Overworld night spawns aren't gated here yet — action resolution has no clock
+    and the env doesn't model sheltered regions; E6 can tighten this.)"""
+    return region.layer not in (Layer.NETHER, Layer.END) and region.structure != Structure.FORTRESS
 
 
 # Superadditive combat (§3.5, E5): for blaze + the ender_dragon, success rises
@@ -70,6 +73,21 @@ def _n_colocated(world: World, agent: AgentState) -> int:
 
 def _fight_success_p(n_colocated: int) -> float:
     return max(0.05, min(0.95, _FIGHT_SOLO_P + _FIGHT_ALLY_GAIN * (n_colocated - 1)))
+
+
+def _target_agent(world: World, agent: AgentState, raw_id: object) -> tuple[AgentState | None, str | None]:
+    """Resolve a teammate id argument for co-op actions."""
+    target_id = str(raw_id or "")
+    if not target_id:
+        return None, "needs target agent"
+    if target_id == agent.agent_id:
+        return None, "cannot target self"
+    target = world.agents.get(target_id)
+    if target is None:
+        return None, f"unknown agent '{target_id}'"
+    if not target.alive:
+        return None, f"agent '{target_id}' is not alive"
+    return target, None
 
 
 # Macro-actions that count as "idle" for the idle-fraction penalty (§7.2).
@@ -150,12 +168,22 @@ def resolve_action(
         # Cross-layer portal travel (§3.1) — explicit, since neighbors never cross
         # layers. Triggered by a portal/layer keyword instead of a compass bearing.
         if isinstance(raw, str) and raw.lower() in ("portal", "nether", "end", "overworld"):
+            requested = raw.lower()
             dest = world.portal_destination(agent.region_id)
             if dest is None:
                 return Resolution(_rec(round_idx, agent, action, False, "no active portal here"))
+            arrived = world.regions[dest]
+            # A specific layer keyword must match where this portal actually leads;
+            # only the generic "portal" follows whatever is linked here. (Else
+            # move{"to":"end"} on a Nether portal would silently go to the Nether —
+            # the env, not the caller, decides where a portal goes.)
+            if requested != "portal" and arrived.layer.value != requested:
+                return Resolution(
+                    _rec(round_idx, agent, action, False,
+                         f"portal here leads to the {arrived.layer.value}, not the {requested}")
+                )
             agent.region_id = dest
             world.enter(dest)  # discover + record NETHER_ENTERED / END_ENTERED
-            arrived = world.regions[dest]
             return Resolution(
                 _rec(
                     round_idx, agent, action, True,
@@ -368,10 +396,86 @@ def resolve_action(
             _rec(round_idx, agent, action, True, result={"ate": "cooked_food", "hunger": agent.hunger})
         )
 
-    # --- deferred to E4 (sleep) / E5 (co-op) ------------------------------ #
-    if name in _UNSUPPORTED:
+    # --- give_item (E5: per-agent inventory + same-region handoff) --------- #
+    if name == ActionName.GIVE_ITEM:
+        target, reason = _target_agent(world, agent, args.get("agent", args.get("to")))
+        if target is None:
+            return Resolution(_rec(round_idx, agent, action, False, reason))
+        item = str(args.get("item", ""))
+        if not item:
+            return Resolution(_rec(round_idx, agent, action, False, "give_item needs an item"))
+        try:
+            n = int(args.get("n", args.get("qty", 1)))
+        except (TypeError, ValueError):
+            return Resolution(_rec(round_idx, agent, action, False, "give_item n must be an integer"))
+        if n <= 0:
+            return Resolution(_rec(round_idx, agent, action, False, "give_item n must be positive"))
+        if target.region_id != agent.region_id:
+            return Resolution(_rec(round_idx, agent, action, False, "give_item requires SAME_REGION"))
+        have = agent.inventory.get(item, 0)
+        if have < n:
+            return Resolution(_rec(round_idx, agent, action, False, f"need {n} {item} (have {have})"))
+        agent.inventory[item] = have - n
+        if agent.inventory[item] <= 0:
+            del agent.inventory[item]
+        target.inventory[item] = target.inventory.get(item, 0) + n
         return Resolution(
-            _rec(round_idx, agent, action, False, f"action '{name.value}' not supported in stub env")
+            _rec(
+                round_idx,
+                agent,
+                action,
+                True,
+                result={"gave": {item: n}, "to": target.agent_id},
+            )
+        )
+
+    # --- regroup (E5: one movement step toward a teammate) ----------------- #
+    if name == ActionName.REGROUP:
+        target, reason = _target_agent(world, agent, args.get("agent", args.get("to")))
+        if target is None:
+            return Resolution(_rec(round_idx, agent, action, False, reason))
+        if target.region_id == agent.region_id:
+            return Resolution(
+                _rec(round_idx, agent, action, True, result={"regrouped": target.agent_id, "same_region": True})
+            )
+        my_region = world.regions[agent.region_id]
+        target_region = world.regions[target.region_id]
+        if my_region.layer != target_region.layer:
+            return Resolution(_rec(round_idx, agent, action, False, "teammate is in another layer"))
+
+        teammate_views = {aid: (band, bearing) for aid, band, bearing, _role in world.teammates_view(agent.agent_id)}
+        _band, bearing = teammate_views.get(target.agent_id, (None, None))
+        if bearing is None:
+            return Resolution(_rec(round_idx, agent, action, False, "no bearing to teammate"))
+        dest = world.resolve_move(agent.region_id, bearing)
+        if dest is None:
+            return Resolution(_rec(round_idx, agent, action, False, f"no route toward {target.agent_id}"))
+        agent.region_id = dest
+        world.enter(dest)
+        arrived = world.regions[dest]
+        return Resolution(
+            _rec(
+                round_idx,
+                agent,
+                action,
+                True,
+                result={
+                    "regrouped_toward": target.agent_id,
+                    "moved_dir": bearing.value,
+                    "arrived_biome": arrived.biome.value,
+                    "same_region": dest == target.region_id,
+                },
+            )
+        )
+
+    # --- sleep (E4 survival: rest safely; restore health; mark SHELTER; §3.3) - #
+    if name == ActionName.SLEEP:
+        if not _sleep_safe(region):
+            return Resolution(_rec(round_idx, agent, action, False, "unsafe to sleep — hostile mobs here"))
+        agent.health = min(1.0, agent.health + _SLEEP_HEALTH_RESTORE)
+        world.world_milestones.add(Milestone.SHELTER)  # world-state milestone (§7.1)
+        return Resolution(
+            _rec(round_idx, agent, action, True, result={"slept": True, "health": agent.health})
         )
 
     return Resolution(_rec(round_idx, agent, action, False, f"unknown action '{name}'"))

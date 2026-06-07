@@ -60,13 +60,55 @@ def test_validity_rejection_move_toward_nothing():
     assert "no region toward" in (rec.reason or "")
 
 
-def test_unsupported_action_rejected():
-    # GIVE_ITEM stays deferred to E5 (co-op) and must still reject with "not supported".
-    # (SMELT/PLACE are E1; FIGHT is E3; EAT is E4 — all implemented + tested elsewhere.)
+def test_sleep_in_safe_region_marks_shelter():
+    # The start region (overworld forest) is safe: SLEEP succeeds and records the
+    # SHELTER milestone, so support/survival progress becomes visible on the ladder.
     env = _fresh_env()
-    res = env.step({"agent_1": Action(name=ActionName.GIVE_ITEM, args={"agent": "agent_2", "item": "wood"})})
+    res = env.step({"agent_1": Action(name=ActionName.SLEEP)})
+    assert res.records[0].valid is True
+    assert res.records[0].result.get("slept") is True
+    assert env.frontier == Milestone.SHELTER
+
+
+def test_give_item_transfers_only_same_region():
+    env = StubEnv(seed="A", agents=[("agent_1", Role.MINER), ("agent_2", Role.SUPPORT)])
+    env.reset()
+    env.world.agents["agent_1"].inventory["wood"] = 3
+
+    res = env.step({
+        "agent_1": Action(name=ActionName.GIVE_ITEM, args={"agent": "agent_2", "item": "wood", "n": 2})
+    })
+    assert res.records[0].valid is True
+    assert env.world.agents["agent_1"].inventory["wood"] == 1
+    assert env.world.agents["agent_2"].inventory["wood"] == 2
+
+
+def test_give_item_rejects_when_not_same_region():
+    env = StubEnv(seed="A", agents=[("agent_1", Role.MINER), ("agent_2", Role.SUPPORT)])
+    env.reset()
+    env.world.agents["agent_1"].inventory["wood"] = 3
+    env.step({"agent_2": Action(name=ActionName.MOVE, args={"direction": "N"})})
+
+    res = env.step({
+        "agent_1": Action(name=ActionName.GIVE_ITEM, args={"agent": "agent_2", "item": "wood", "n": 1})
+    })
     assert res.records[0].valid is False
-    assert "not supported" in (res.records[0].reason or "")
+    assert "SAME_REGION" in (res.records[0].reason or "")
+    assert env.world.agents["agent_1"].inventory["wood"] == 3
+    assert env.world.agents["agent_2"].inventory.get("wood", 0) == 0
+
+
+def test_regroup_moves_toward_teammate():
+    env = StubEnv(seed="A", agents=[("agent_1", Role.MINER), ("agent_2", Role.SUPPORT)])
+    env.reset()
+    env.step({"agent_2": Action(name=ActionName.MOVE, args={"direction": "N"})})
+    target_region = env.world.agents["agent_2"].region_id
+    assert env.world.agents["agent_1"].region_id != target_region
+
+    res = env.step({"agent_1": Action(name=ActionName.REGROUP, args={"agent": "agent_2"})})
+    assert res.records[0].valid is True
+    assert env.world.agents["agent_1"].region_id == target_region
+    assert res.records[0].result["same_region"] is True
 
 
 def test_frontier_is_max_and_monotonic():

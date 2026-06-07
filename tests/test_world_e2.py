@@ -211,6 +211,33 @@ def test_nether_portal_round_trip_returns_to_overworld():
     assert world.regions[agent.region_id].layer == Layer.OVERWORLD
 
 
+def test_portal_move_rejects_mismatched_target_layer():
+    # A nether portal here leads to the Nether; asking for a *different* layer is
+    # rejected (the env, not the caller, decides where a portal goes). The matching
+    # layer keyword and the generic "portal" keyword both still work.
+    world = make_world("A")
+    agent = _agent_at(world, "r_00", inventory={"nether_portal": 1})
+    _do(world, agent, Action(name=ActionName.PLACE, args={"item": "nether_portal"}))
+
+    bad = _do(world, agent, Action(name=ActionName.MOVE, args={"to": "end"}))
+    assert bad.valid is False
+    assert "not the end" in (bad.reason or "")
+    assert agent.region_id == "r_00"  # did not move
+
+    good = _do(world, agent, Action(name=ActionName.MOVE, args={"to": "nether"}))
+    assert good.valid is True
+    assert agent.region_id == world.nether_entry_id
+
+
+def test_generic_portal_keyword_follows_whatever_is_linked():
+    world = make_world("A")
+    agent = _agent_at(world, "r_00", inventory={"nether_portal": 1})
+    _do(world, agent, Action(name=ActionName.PLACE, args={"item": "nether_portal"}))
+    moved = _do(world, agent, Action(name=ActionName.MOVE, args={"to": "portal"}))
+    assert moved.valid is True
+    assert world.regions[agent.region_id].layer == Layer.NETHER
+
+
 # =========================================================================== #
 # Cross-layer transitions: End (happy + rejections)
 # =========================================================================== #
@@ -223,6 +250,20 @@ def test_activate_and_enter_end_portal_at_stronghold():
     moved = _do(world, agent, Action(name=ActionName.MOVE, args={"to": "end"}))
     assert moved.valid is True
     assert agent.region_id == world.end_region_id
+    assert world.regions[agent.region_id].layer == Layer.END
+
+
+def test_end_portal_rejects_non_end_target():
+    # The reviewer's repro: move{"to":"overworld"} on the End portal must NOT walk
+    # the agent into the End. Only "end" (or generic "portal") follows it.
+    world = make_world("A")
+    agent = _agent_at(world, world.stronghold_id, inventory={"end_portal": 1})
+    _do(world, agent, Action(name=ActionName.PLACE, args={"item": "end_portal"}))
+    rec = _do(world, agent, Action(name=ActionName.MOVE, args={"to": "overworld"}))
+    assert rec.valid is False
+    assert agent.region_id == world.stronghold_id  # stayed put
+    follow = _do(world, agent, Action(name=ActionName.MOVE, args={"to": "end"}))
+    assert follow.valid is True
     assert world.regions[agent.region_id].layer == Layer.END
 
 
