@@ -6,10 +6,10 @@ present, move toward nothing) are **rejected, produce no effect, and are logged
 as ``invalid_action`` with a reason** (§3.3). Invalid-action rate is a tracked
 metric (§7.2, §10).
 
-Phase 0 implements the shallow action set the oracle needs — move, scout,
-gather, craft, wait, report/request_help — plus graceful rejection of the deeper
-actions (smelt/place/fight/eat/sleep/give_item/regroup) that Stream 1 (E1, E4,
-E5) will fill in.
+Phase 0 implemented the shallow action set the oracle needs — move, scout,
+gather, craft, wait, report/request_help. Stream 1 E1 adds ``smelt`` and
+``place`` (below); ``fight``/``eat``/``sleep``/``give_item``/``regroup`` stay
+gracefully rejected until E4 (survival) / E5 (co-op).
 """
 
 from __future__ import annotations
@@ -24,10 +24,9 @@ from contracts.enums import ActionName, Bearing, MessageType
 from . import techtree
 from .world import AgentState, World
 
-# Actions deferred to Stream 1; rejected (validly logged) in the stub.
+# Actions still deferred (rejected + validly logged). E1 implements SMELT + PLACE
+# below; FIGHT/EAT/SLEEP/GIVE_ITEM/REGROUP land in E4 (survival) / E5 (co-op).
 _UNSUPPORTED = {
-    ActionName.SMELT,
-    ActionName.PLACE,
     ActionName.FIGHT,
     ActionName.EAT,
     ActionName.SLEEP,
@@ -181,7 +180,45 @@ def resolve_action(
             _rec(round_idx, agent, action, True, result={"crafted": dict(recipe.outputs)})
         )
 
-    # --- deferred to Stream 1 --------------------------------------------- #
+    # --- smelt (furnace + fuel: ore -> ingot, raw food -> cooked; §3.4) ----- #
+    if name == ActionName.SMELT:
+        item = str(args.get("item", args.get("resource", "")))
+        ok, reason = techtree.smelt_check(item, agent.inventory)
+        if not ok:
+            return Resolution(_rec(round_idx, agent, action, False, reason))
+        output = techtree.SMELTS[item]
+        # Consume one input + one unit of fuel; the furnace persists (prerequisite).
+        agent.inventory[item] -= 1
+        if agent.inventory[item] <= 0:
+            del agent.inventory[item]
+        agent.inventory[techtree.SMELT_FUEL] -= 1
+        if agent.inventory[techtree.SMELT_FUEL] <= 0:
+            del agent.inventory[techtree.SMELT_FUEL]
+        agent.inventory[output] = agent.inventory.get(output, 0) + 1
+        return Resolution(
+            _rec(round_idx, agent, action, True, result={"smelted": {output: 1}})
+        )
+
+    # --- place (put a block into the world; e.g. obsidian portal frame) ----- #
+    if name == ActionName.PLACE:
+        item = str(args.get("item", args.get("block", "")))
+        if not item:
+            return Resolution(_rec(round_idx, agent, action, False, "place needs an item"))
+        if item not in techtree.PLACEABLE_BLOCKS:
+            return Resolution(
+                _rec(round_idx, agent, action, False, f"cannot place '{item}'")
+            )
+        if agent.inventory.get(item, 0) <= 0:
+            return Resolution(
+                _rec(round_idx, agent, action, False, f"no {item} to place")
+            )
+        agent.inventory[item] -= 1
+        if agent.inventory[item] <= 0:
+            del agent.inventory[item]
+        # TODO E2: attach the placed block to region world-state (portal frame).
+        return Resolution(_rec(round_idx, agent, action, True, result={"placed": item}))
+
+    # --- deferred to E4 (survival) / E5 (co-op) --------------------------- #
     if name in _UNSUPPORTED:
         return Resolution(
             _rec(round_idx, agent, action, False, f"action '{name.value}' not supported in stub env")

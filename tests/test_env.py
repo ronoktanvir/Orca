@@ -61,8 +61,10 @@ def test_validity_rejection_move_toward_nothing():
 
 
 def test_unsupported_action_rejected():
+    # FIGHT stays deferred to E4/E5 and must still reject with "not supported".
+    # (SMELT/PLACE are implemented in E1 — covered by tests/test_techtree_e1.py.)
     env = _fresh_env()
-    res = env.step({"agent_1": Action(name=ActionName.SMELT, args={"item": "iron_ingot"})})
+    res = env.step({"agent_1": Action(name=ActionName.FIGHT, args={"target": "zombie"})})
     assert res.records[0].valid is False
     assert "not supported" in (res.records[0].reason or "")
 
