@@ -199,10 +199,10 @@ def test_build_agents_no_card_preserves_roster_role():
     agents = build_agents(list(DEFAULT_ROSTER), llm=StubLLM())  # no behavior_cards passed
     got = {a.agent_id: a.role for a in agents}
     assert got == {
-        "agent_1": Role.EXPLORER,
-        "agent_2": Role.MINER,
-        "agent_3": Role.TINKERER,
-        "agent_4": Role.SUPPORT,
+        "Aryan": Role.EXPLORER,
+        "Madhav": Role.MINER,
+        "Telmunn": Role.TINKERER,
+        "Saji": Role.SUPPORT,
     }
     for a in agents:
         prompt = build_worker_prompt(sample_observation(), a.card, a.memory)

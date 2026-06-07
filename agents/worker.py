@@ -234,9 +234,23 @@ class LLMWorker:
                 break
         return out
 
+    @staticmethod
+    def _action_hint(action: Action) -> str:
+        """A compact, leak-free arg hint for the history line (e.g. the crafted
+        item / gathered resource / move direction). Makes a repeated invalid
+        attempt visible in the compacted history, not just the live obs (§4.3)."""
+        args = action.args or {}
+        for key in ("item", "resource", "direction", "target", "agent"):
+            val = args.get(key)
+            if isinstance(val, str) and val:
+                return val
+        return ""
+
     def _finish(self, obs: Observation, action: Action) -> Action:
         """Update the bounded running history summary, then return the action."""
-        self._history_lines.append(f"r{obs.round}:{action.name.value}")
+        hint = self._action_hint(action)
+        line = f"r{obs.round}:{action.name.value}" + (f"({hint})" if hint else "")
+        self._history_lines.append(line)
         self.history_summary = self._compose_history()
         self._emit(
             "worker_decision",

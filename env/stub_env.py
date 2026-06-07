@@ -96,6 +96,9 @@ class StubEnv:
         self.milestone_timeline: list[MilestoneEvent] = []
         self.all_messages: list[Message] = []
         self.all_records: list[ActionRecord] = []
+        # Most recent resolved ActionRecord per agent, surfaced as obs.last_action
+        # next round so a worker sees why its prior action was rejected (§3.3).
+        self._last_record: dict[str, ActionRecord] = {}
         self._inbox: list[Message] = []  # delivered this round
         self._posted: list[Message] = []  # posted this round -> delivered next round
         self._terminated_reason: Optional[str] = None
@@ -118,6 +121,7 @@ class StubEnv:
         self.milestone_timeline = [MilestoneEvent(milestone=Milestone.START, round=0)]
         self.all_messages.clear()
         self.all_records.clear()
+        self._last_record.clear()
         self._inbox.clear()
         self._posted.clear()
         self._terminated_reason = None
@@ -137,6 +141,7 @@ class StubEnv:
             assignment=assignment,
             frontier=self.frontier,
             recent_messages=recent,
+            last_record=self._last_record.get(agent_id),
         )
 
     def _recent_for(self, agent_id: str) -> list[Message]:
@@ -230,6 +235,7 @@ class StubEnv:
             res = resolve_action(self.world, agent, action, rng, self.round_idx)
             result.records.append(res.record)
             self.all_records.append(res.record)
+            self._last_record[aid] = res.record  # feedback for next obs (§3.3)
             if res.message is not None:
                 self._posted.append(res.message)
                 self.all_messages.append(res.message)

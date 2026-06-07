@@ -12,12 +12,23 @@ from __future__ import annotations
 from contracts import BehaviorCard
 from contracts.enums import Role
 
-# Default soft-role roster (§4.1).
+# Human names for the four soft roles (§4.1). The agent_id IS the name, so it
+# flows unchanged into messages, teammate views, behavior cards, the event log,
+# and reward stats — the team reads as people, not "agent_3". Keep in sync with
+# the recipient allow-list in ``bus/messages.py`` (guarded by tests/test_bus.py).
+NAME_BY_ROLE: dict[Role, str] = {
+    Role.EXPLORER: "Aryan",
+    Role.MINER: "Madhav",
+    Role.TINKERER: "Telmunn",
+    Role.SUPPORT: "Saji",
+}
+
+# Default soft-role roster (§4.1), one named agent per role.
 DEFAULT_ROSTER: list[tuple[str, Role]] = [
-    ("agent_1", Role.EXPLORER),
-    ("agent_2", Role.MINER),
-    ("agent_3", Role.TINKERER),
-    ("agent_4", Role.SUPPORT),
+    (NAME_BY_ROLE[Role.EXPLORER], Role.EXPLORER),
+    (NAME_BY_ROLE[Role.MINER], Role.MINER),
+    (NAME_BY_ROLE[Role.TINKERER], Role.TINKERER),
+    (NAME_BY_ROLE[Role.SUPPORT], Role.SUPPORT),
 ]
 
 _ROLE_ASSIGNMENT: dict[Role, str] = {
@@ -45,4 +56,4 @@ def default_cards(roster: list[tuple[str, Role]]) -> dict[str, BehaviorCard]:
     return {aid: make_default_card(aid, role) for aid, role in roster}
 
 
-__all__ = ["DEFAULT_ROSTER", "make_default_card", "default_cards"]
+__all__ = ["DEFAULT_ROSTER", "NAME_BY_ROLE", "make_default_card", "default_cards"]

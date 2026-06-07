@@ -13,24 +13,30 @@ import re
 from contracts import Message
 from contracts.enums import MessageType
 
-# A message recipient is the team broadcast, the manager, or an agent id matching
-# the project convention (``agent_1`` / ``agent_2`` / ...). Anything else — a
-# leaky region id like ``r_07``, a coordinate-like string, free text — is invalid.
+# A message recipient is the team broadcast, the manager, an agent id matching the
+# project convention (``agent_1`` / ``agent_2`` / ...), or a named roster member.
+# Anything else — a leaky region id like ``r_07``, a coordinate-like string, free
+# text — is invalid and downgraded to ``team``.
 _AGENT_ID = re.compile(r"^agent_\d+$")
 _FIXED_RECIPIENTS = ("team", "orca")
+# Named roster members (see orca/cards.py NAME_BY_ROLE). Listed explicitly so a
+# directed message to a teammate by name is a valid recipient and not downgraded
+# to ``team``. Kept in sync with the roster by tests/test_bus.py.
+_NAMED_AGENTS = frozenset({"Aryan", "Madhav", "Telmunn", "Saji"})
 
 
 def normalize_recipient(to: object) -> str:
     """Coerce a message recipient to a safe, leak-free value (§5.1).
 
-    Valid recipients are exactly ``"team"``, ``"orca"``, or an ``agent_<n>`` id.
-    Anything else (an internal region id like ``r_07``, a coordinate-like string,
-    or arbitrary free text) is downgraded to ``"team"`` — chosen over *dropping*
-    so the message still reaches the team, but the leaky/invalid recipient string
-    never reaches ``Message.to``, ``pending_messages``, the bus, or the trace.
+    Valid recipients are exactly ``"team"``, ``"orca"``, an ``agent_<n>`` id, or a
+    named roster member (:data:`_NAMED_AGENTS`). Anything else (an internal region
+    id like ``r_07``, a coordinate-like string, or arbitrary free text) is
+    downgraded to ``"team"`` — chosen over *dropping* so the message still reaches
+    the team, but the leaky/invalid recipient string never reaches ``Message.to``,
+    ``pending_messages``, the bus, or the trace.
     """
     t = (to if isinstance(to, str) else str(to or "")).strip()
-    if t in _FIXED_RECIPIENTS or _AGENT_ID.match(t):
+    if t in _FIXED_RECIPIENTS or t in _NAMED_AGENTS or _AGENT_ID.match(t):
         return t
     return "team"
 

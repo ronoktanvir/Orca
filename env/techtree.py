@@ -241,8 +241,45 @@ RECIPES: dict[str, Recipe] = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# Item-name aliases (§3.4 robustness). LLM workers reliably emit Minecraft-correct
+# or lightly-reworded item names (``wooden_planks`` for ``planks``, ``stick`` for
+# ``sticks``, ``Crafting Table`` for ``crafting_table``). Those are *not* recipe
+# keys, so a naive lookup rejects the craft as invalid — a wasted turn that, with
+# no feedback, the worker repeats indefinitely (the observed craft-loop deadlock).
+# ``canonical_item`` normalizes case/spacing and maps known synonyms onto the
+# canonical recipe key so the intended craft resolves. Unknown names still fall
+# through to the real recipe table (and an honest "no recipe" reason).
+# --------------------------------------------------------------------------- #
+RECIPE_ALIASES: dict[str, str] = {
+    "wooden_planks": "planks",
+    "wood_planks": "planks",
+    "wood_plank": "planks",
+    "plank": "planks",
+    "stick": "sticks",
+    "table": "crafting_table",
+    "workbench": "crafting_table",
+    "work_bench": "crafting_table",
+    "wood_pickaxe": "wooden_pickaxe",
+    "woodpickaxe": "wooden_pickaxe",
+    "wood_sword": "stone_sword",  # no wooden sword in this tree; nearest tier
+    "smelter": "furnace",
+}
+
+
+def canonical_item(item: str) -> str:
+    """Map a (possibly reworded) item name onto its canonical recipe key (§3.4).
+
+    Normalizes case + spacing/hyphens to underscores, then applies the synonym
+    table. Anything already canonical (or genuinely unknown) is returned as-is so
+    ``craft_check`` still reports an honest "no recipe" for true typos."""
+    key = item.strip().lower().replace(" ", "_").replace("-", "_")
+    return RECIPE_ALIASES.get(key, key if key in RECIPES else item)
+
+
 def craft_check(item: str, inventory: dict[str, int]) -> tuple[bool, str | None]:
     """Can ``item`` be crafted from ``inventory``? Returns (ok, reason_if_not)."""
+    item = canonical_item(item)
     recipe = RECIPES.get(item)
     if recipe is None:
         return False, f"no recipe for '{item}'"
@@ -406,7 +443,9 @@ __all__ = [
     "PICKAXE_TIERS",
     "GATHER_GATES",
     "RECIPES",
+    "RECIPE_ALIASES",
     "Recipe",
+    "canonical_item",
     "SMELTS",
     "SMELT_FUEL",
     "PLACEABLE_BLOCKS",

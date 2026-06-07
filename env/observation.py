@@ -10,10 +10,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import re
+
 from contracts import (
+    ActionRecord,
     Exit,
     HereView,
     Landmark,
+    LastActionView,
     Message,
     Observation,
     SelfView,
@@ -23,6 +27,25 @@ from contracts.enums import Layer, Milestone, Structure, TimeOfDay
 
 if TYPE_CHECKING:  # avoid import cycle at runtime; type-only
     from .world import Region, World
+
+# Defense-in-depth: env-generated reason strings are coordinate-free by
+# construction, but never let a coordinate-like span (a float/int pair, an
+# ``r_NN`` region id, or a "<n> blocks" distance) ride a reason into the obs (§3.2).
+_REASON_LEAK = re.compile(
+    r"-?\d+\s*[,;]\s*-?\d+|\br_\d+\b|\b\d+\s*(?:blocks?|meters?|tiles?|steps?)\b",
+    re.IGNORECASE,
+)
+
+
+def _last_action_view(record: "ActionRecord | None") -> "LastActionView | None":
+    """Coord-free feedback on the agent's previous action (§3.3), or None."""
+    if record is None:
+        return None
+    reason = record.reason
+    if reason:
+        reason = _REASON_LEAK.sub(" ", reason)
+        reason = re.sub(r"\s+", " ", reason).strip()[:160] or None
+    return LastActionView(name=record.action.name.value, valid=record.valid, reason=reason)
 
 
 def time_of_day(round_idx: int, day_length: int) -> TimeOfDay:
@@ -63,6 +86,7 @@ def serialize_observation(
     recent_messages: list[Message] | None = None,
     mobs: list[str] | None = None,
     landmarks: list[Landmark] | None = None,
+    last_record: "ActionRecord | None" = None,
 ) -> Observation:
     """Build the coordinate-free observation for one agent.
 
@@ -122,6 +146,7 @@ def serialize_observation(
         recent_messages=list(recent_messages or []),
         assignment=assignment,
         dag_frontier_reached=frontier.value,
+        last_action=_last_action_view(last_record),
     )
 
 

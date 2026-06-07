@@ -44,6 +44,7 @@ from .observation import (
     Exit,
     HereView,
     Landmark,
+    LastActionView,
     Observation,
     SelfView,
     TeammateView,
@@ -74,6 +75,7 @@ __all__ = [
     "Exit",
     "HereView",
     "Landmark",
+    "LastActionView",
     "SelfView",
     "TeammateView",
     # episode sub-models
