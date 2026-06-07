@@ -31,7 +31,14 @@ from agents.worker import LLMWorker
 from bus import CommBus
 from bus.messages import normalize_recipient
 from config import OrcaSettings, load_config
-from contracts import EpisodeMetrics, EpisodeTrace, ExecutionMemory, Message, Observation
+from contracts import (
+    EpisodeMetrics,
+    EpisodeTrace,
+    ExecutionMemory,
+    Message,
+    Observation,
+    ReasoningRecord,
+)
 from contracts.enums import Milestone, Role
 from env import StubEnv
 from llm import build_llm
@@ -170,6 +177,7 @@ def _round_actions(
     concurrency: int,
     *,
     bus: Optional[CommBus] = None,
+    reasoning_log: Optional[list] = None,
 ) -> dict:
     """Collect one round's actions.
 
@@ -210,6 +218,21 @@ def _round_actions(
                 "args": action.args,
             },
         )
+        # Thread the worker LLM's own reasoning onto the trace so Orca's coach can
+        # read *how* it reasoned (§6.4) — scrubbed at this boundary for EVERY worker
+        # (the leak wall applies to reasoning as much as to messages/args, §3.2).
+        if reasoning_log is not None:
+            raw_reason = (getattr(agent, "last_reasoning", "") or "").strip()
+            if raw_reason:
+                safe = (
+                    scrub_seed_specific(raw_reason)
+                    if looks_seed_specific(raw_reason)
+                    else raw_reason
+                ).strip()
+                if safe:
+                    reasoning_log.append(
+                        ReasoningRecord(round=_obs.round, agent_id=agent.agent_id, text=safe)
+                    )
 
     if bus is not None:
         for agent, _obs in obs_by:
@@ -241,6 +264,7 @@ def run_episode(
     """Run one full episode end-to-end; emit EpisodeTrace + EpisodeMetrics (§8)."""
     env.reset()
     obs_snapshots: list[dict] = []
+    reasoning_log: list[ReasoningRecord] = []
     concurrency = _effective_concurrency(settings, len(agents))
 
     while not env.done:
@@ -251,6 +275,7 @@ def run_episode(
             telemetry,
             concurrency,
             bus=bus,
+            reasoning_log=reasoning_log,
         )
         env_step(env, actions)
         if bus is not None:
@@ -278,6 +303,7 @@ def run_episode(
         frontier_reached=env.frontier,
         terminated_reason=env.terminated_reason,
         observations=obs_snapshots,
+        reasoning_log=reasoning_log,
     )
 
     metrics = op(reward_computer)(
@@ -530,13 +556,20 @@ def run(
         orca = orca or NoOpOrca(roster)
     else:
         roster = list(DEFAULT_ROSTER)
-        orca = orca or Orca(
-            roster,
-            llm=llm,
-            epsilon=settings.bandit.epsilon,
-            seed=0,
-            telemetry=telemetry,
-        )
+        if orca is None:
+            # Orca's verbal coach runs on its OWN model (§6.4/§11): default GLM-5.1
+            # via W&B Inference with the OpenAI fallback (or the explicit ``llm``).
+            # The client is lazy, so building it is offline-safe — it only calls out
+            # once the coach actually fires (Phase >= 1), and on any failure the coach
+            # falls back to the deterministic heuristic path (coach._call_llm).
+            orca_llm = llm if llm is not None else build_llm("orca", settings)
+            orca = Orca(
+                roster,
+                llm=orca_llm,
+                epsilon=settings.bandit.epsilon,
+                seed=0,
+                telemetry=telemetry,
+            )
         if worker_factory is None:
             worker_llm = build_llm("worker", settings)
             memories = {aid: ExecutionMemory(agent_id=aid) for aid, _role in roster}

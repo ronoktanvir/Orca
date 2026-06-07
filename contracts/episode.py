@@ -42,6 +42,20 @@ class MilestoneEvent(BaseModel):
     round: int = Field(ge=0)
 
 
+class ReasoningRecord(BaseModel):
+    """One worker's natural-language reasoning for a single turn (§6.1, §6.4).
+
+    This is the worker LLM's own "why I did this" — the same text that surfaces in
+    Weave's ``worker_decision`` event. Recording it on the trace (already scrubbed
+    through the coordinate-leak filter, §3.2) lets Orca's coach read *how* a worker
+    reasoned, not just its action counts — without round-tripping the Weave API.
+    """
+
+    round: int = Field(ge=0)
+    agent_id: str
+    text: str = ""
+
+
 class EpisodeTrace(BaseModel):
     """The full, replayable record of one episode."""
 
@@ -59,6 +73,9 @@ class EpisodeTrace(BaseModel):
     terminated_reason: str = "t_max"  # "win" | "frontier_target" | "t_max" | "all_failed"
     # Coordinate-free observation snapshots, kept for audit + the coord-leak test.
     observations: list[dict] = Field(default_factory=list)
+    # Per-turn worker LLM reasoning (scrubbed) — lets Orca's coach read *how* each
+    # worker reasoned, not just its action stats (§6.1/§6.4). Additive/optional.
+    reasoning_log: list[ReasoningRecord] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -107,5 +124,6 @@ __all__ = [
     "EpisodeMetrics",
     "ActionRecord",
     "MilestoneEvent",
+    "ReasoningRecord",
     "AgentStats",
 ]
