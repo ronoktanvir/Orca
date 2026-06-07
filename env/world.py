@@ -128,6 +128,12 @@ class World:
         # the Nether entered, the dragon slain); detect_frontier folds them into
         # the team frontier. Set by actions.py on discovery/arrival/combat.
         self.world_milestones: set[Milestone] = set()
+        # The stronghold sits in the Overworld as a plain discoverable cell, but in
+        # the DAG you only *find* it via eyes of ender (§3.4/§7.1). Track that the
+        # cell has been seen; STRONGHOLD_FOUND is gated on the eyes prereq and
+        # (re)checked in ``refresh_structure_milestones`` so a wandering explorer
+        # can't claim the 0.80 frontier for free.
+        self._stronghold_seen = False
 
     # -- agent management --------------------------------------------------- #
     def add_agent(self, agent: AgentState) -> None:
@@ -229,8 +235,28 @@ class World:
         region = self.regions[region_id]
         region.discovered = True
         if region.structure == Structure.FORTRESS:
+            # Fortress is a Nether cell — reaching it already required building and
+            # lighting a portal (the tech chain), so discovery is a fair trigger.
             self.world_milestones.add(Milestone.FORTRESS_FOUND)
         elif region.structure == Structure.STRONGHOLD:
+            # Seeing the cell is necessary but not sufficient: gate on the eyes-of-
+            # ender prereq (checked below + each round in stub_env), so it fires
+            # whether the eyes are acquired before or after the cell is first seen.
+            self._stronghold_seen = True
+        self.refresh_structure_milestones()
+
+    def refresh_structure_milestones(self) -> None:
+        """Record prereq-gated structure milestones whose prerequisites are now met.
+
+        STRONGHOLD_FOUND requires an eye of ender on hand — in the DAG you locate
+        the stronghold by throwing one (§3.4/§7.1); without it a wandering explorer
+        must not be able to claim the milestone. Idempotent + monotonic (a set), so
+        it's safe to call on every discovery and once per round."""
+        if (
+            self._stronghold_seen
+            and Milestone.STRONGHOLD_FOUND not in self.world_milestones
+            and self.pooled_inventory().get("eye_of_ender", 0) > 0
+        ):
             self.world_milestones.add(Milestone.STRONGHOLD_FOUND)
 
     def enter(self, region_id: str) -> None:
