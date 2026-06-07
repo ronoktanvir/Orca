@@ -32,5 +32,6 @@ seeds:
 
 telemetry:
   mode: "auto"            # auto | weave | local | off  (auto => weave iff creds)
+  entity: "ronoktanvir-university-of-california-berkeley"  # W&B team; null => default
   project: "orca"
   run_dir: "runs"

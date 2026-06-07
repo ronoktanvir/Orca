@@ -53,6 +53,7 @@ class SeedsConfig(BaseModel):
 
 class TelemetryConfig(BaseModel):
     mode: str = "auto"  # auto | weave | local | off
+    entity: Optional[str] = None  # W&B entity (team); None => W&B default entity
     project: str = "orca"
     run_dir: str = "runs"
 

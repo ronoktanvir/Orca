@@ -48,6 +48,7 @@ def main(argv: list[str] | None = None) -> int:
 
     telemetry = init_telemetry(
         mode=settings.telemetry.mode,
+        entity=settings.telemetry.entity,
         project=settings.telemetry.project,
         run_dir=settings.telemetry.run_dir,
     )

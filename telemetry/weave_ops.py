@@ -123,6 +123,7 @@ def _has_wandb_cred() -> bool:
 def init_telemetry(
     *,
     mode: str = "auto",
+    entity: Optional[str] = None,
     project: str = "orca",
     run_dir: str = "runs",
     run_id: Optional[str] = None,
@@ -134,6 +135,10 @@ def init_telemetry(
       - local : local-JSONL artifacts, identity ops.
       - weave : try Weave; fall back to local on any failure.
       - auto  : weave iff importable AND a W&B credential is present, else local.
+
+    entity: W&B entity (team) to log under. Weave needs ``entity/project``; with
+      ``None`` it relies on the account's default entity, which is unset for
+      fresh accounts ("could not determine a W&B entity"). Set it explicitly.
     """
     global _BACKEND, _weave
     run_id = run_id or _now_stamp()
@@ -152,7 +157,8 @@ def init_telemetry(
             try:
                 import weave as _w  # type: ignore
 
-                _w.init(project)
+                target = f"{entity}/{project}" if entity else project
+                _w.init(target)
                 _weave = _w
                 _BACKEND = "weave"
                 return Telemetry("weave", run_dir, run_id)
