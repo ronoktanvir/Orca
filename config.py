@@ -64,23 +64,26 @@ class AgentsConfig(BaseModel):
 class LLMConfig(BaseModel):
     """Swappable model config (§11). provider: openai | wandb_inference.
 
-    ``provider`` is the global default; ``worker_provider`` / ``orca_provider``
-    override it *per role* so you can run the cost/throughput hybrid — high-volume
-    workers on GLM via W&B Inference (no rate limit, $50 credits) and Orca on
-    gpt-5 — by setting ``worker_provider: wandb_inference`` and leaving
-    ``orca_provider`` unset (falls back to ``provider: openai``)."""
+    Default: **GLM-5.1 on W&B Inference** for both roles, with **OpenAI as the
+    automatic backup** (``fallback_provider``) when a primary call fails. The
+    per-role ``worker_provider`` / ``orca_provider`` still override ``provider``
+    (e.g. the GLM-workers + gpt-5-Orca hybrid). ``worker_model`` / ``orca_model``
+    double as the OpenAI fallback models."""
 
-    provider: str = "openai"
+    provider: str = "wandb_inference"  # primary: GLM-5.1 via W&B Inference ($50 credits)
     worker_provider: Optional[str] = None  # overrides provider for the 4 workers
     orca_provider: Optional[str] = None  # overrides provider for Orca
-    worker_model: str = "gpt-5-mini"  # 4 workers: cheap/fast, high call volume
-    orca_model: str = "gpt-5"  # Orca: strong reasoning, 1 call/episode
+    # Backup provider used when the primary ``complete()`` raises (rate limit, 5xx,
+    # endpoint down). None disables fallback; skipped when it equals the primary.
+    fallback_provider: Optional[str] = "openai"
+    worker_model: str = "gpt-5-mini"  # workers on OpenAI (also the worker fallback)
+    orca_model: str = "gpt-5"  # Orca on OpenAI (also the Orca fallback)
     temperature: float = 0.2  # §15
     openai_base_url: Optional[str] = None  # None => api.openai.com
-    # W&B Inference (GLM) — billed to W&B credits; an alternate/ablation provider.
+    # W&B Inference (GLM) — billed to W&B credits.
     wandb_inference_base_url: str = "https://api.inference.wandb.ai/v1"
-    wandb_inference_model: str = "zai-org/GLM-4.6"  # set to the GLM-5.1 id when confirmed
-    wandb_inference_orca_model: Optional[str] = None  # optional distinct GLM model for Orca
+    wandb_inference_model: str = "zai-org/GLM-5.1"  # primary worker+Orca model (confirmed live)
+    wandb_inference_orca_model: Optional[str] = None  # None => same as wandb_inference_model
 
 
 class RewardConfig(BaseModel):

@@ -12,7 +12,7 @@ run:
 llm:
   provider: "openai"                    # Orca stays on gpt-5 (global default)
   worker_provider: "wandb_inference"    # workers -> GLM via W&B Inference
-  wandb_inference_model: "zai-org/GLM-4.6"   # <-- set to the confirmed GLM-5.1 id
+  wandb_inference_model: "zai-org/GLM-5.1"   # confirmed live on the W&B endpoint
 
 eval:
   n_train: 60

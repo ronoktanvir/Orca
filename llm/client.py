@@ -20,10 +20,13 @@ Design notes:
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Optional, Protocol, runtime_checkable
 
 from telemetry import op
+
+_log = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -114,25 +117,63 @@ class OpenAIClient:
         return resp.choices[0].message.content or ""
 
 
+class FallbackLLM:
+    """A primary client with an automatic backup (§11).
+
+    Tries ``primary.complete`` first; on **any** exception (rate limit, 5xx,
+    endpoint down, ...) logs a warning and retries once on ``backup``. JSON
+    validation is the caller's job (§4.4), so an exception reaching here is always
+    a transport/API failure — exactly when a backup helps. If the backup also
+    fails, a single error chaining both is raised.
+    """
+
+    def __init__(
+        self,
+        primary: LLMClient,
+        backup: LLMClient,
+        *,
+        primary_name: str = "primary",
+        backup_name: str = "backup",
+    ) -> None:
+        self.primary = primary
+        self.backup = backup
+        self.primary_name = primary_name
+        self.backup_name = backup_name
+
+    @op
+    def complete(self, prompt: str, schema: Optional[type] = None, **kwargs: Any) -> str:
+        try:
+            return self.primary.complete(prompt, schema, **kwargs)
+        except Exception as primary_exc:
+            _log.warning(
+                "LLM primary (%s) failed: %s — falling back to %s",
+                self.primary_name,
+                primary_exc,
+                self.backup_name,
+            )
+            try:
+                return self.backup.complete(prompt, schema, **kwargs)
+            except Exception as backup_exc:
+                raise RuntimeError(
+                    f"both LLM providers failed — primary={self.primary_name} "
+                    f"({primary_exc!r}); backup={self.backup_name} ({backup_exc!r})"
+                ) from backup_exc
+
+
 def _provider_for(role: str, cfg: Any) -> str:
     """Resolve the provider for ``role`` (per-role override -> global default)."""
     per_role = cfg.orca_provider if role == "orca" else cfg.worker_provider
     return per_role or cfg.provider
 
 
-def build_llm(role: str, settings: Any) -> LLMClient:
-    """Construct the configured LLM for a role ('worker' | 'orca') (§11).
-
-    Provider is resolved per role (``worker_provider`` / ``orca_provider`` override
-    the global ``provider``), enabling the hybrid: GLM workers (W&B Inference) +
-    gpt-5 Orca (OpenAI).
+def _build_single(role: str, settings: Any, provider: str) -> LLMClient:
+    """Build one (unwrapped) client for ``role`` on the given ``provider``.
       * 'openai'          -> worker_model / orca_model on the OpenAI API.
       * 'wandb_inference' -> GLM on the W&B Inference OpenAI-compatible endpoint
         (worker uses ``wandb_inference_model``; Orca uses
         ``wandb_inference_orca_model`` if set, else the same), billed to W&B credits.
     """
     cfg = settings.llm
-    provider = _provider_for(role, cfg)
     if provider == "wandb_inference":
         headers = None
         # Prefer the configured telemetry identifiers (single source of truth),
@@ -158,4 +199,24 @@ def build_llm(role: str, settings: Any) -> LLMClient:
     return OpenAIClient(model=model, temperature=cfg.temperature, base_url=cfg.openai_base_url)
 
 
-__all__ = ["LLMClient", "StubLLM", "OpenAIClient", "build_llm"]
+def build_llm(role: str, settings: Any) -> LLMClient:
+    """Construct the configured LLM for a role ('worker' | 'orca') (§11).
+
+    Provider is resolved per role (``worker_provider`` / ``orca_provider`` override
+    the global ``provider``). When ``fallback_provider`` is set and differs from the
+    resolved primary, the client is wrapped in :class:`FallbackLLM` so a failed
+    primary call (e.g. GLM/W&B unavailable) automatically retries on the backup
+    (e.g. OpenAI). Default config: GLM-5.1 primary + OpenAI backup.
+    """
+    cfg = settings.llm
+    provider = _provider_for(role, cfg)
+    primary = _build_single(role, settings, provider)
+
+    fallback = getattr(cfg, "fallback_provider", None)
+    if fallback and fallback != provider:
+        backup = _build_single(role, settings, fallback)
+        return FallbackLLM(primary, backup, primary_name=provider, backup_name=fallback)
+    return primary
+
+
+__all__ = ["LLMClient", "StubLLM", "OpenAIClient", "FallbackLLM", "build_llm"]
