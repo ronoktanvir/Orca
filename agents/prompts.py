@@ -36,7 +36,7 @@ ACTION_MENU: dict[ActionName, str] = {
     ActionName.GATHER: 'args: {"resource": "<name>"} — needs the right tool/biome',
     ActionName.CRAFT: 'args: {"item": "<name>"} — needs inputs + table',
     ActionName.SMELT: 'args: {"item": "<name>"} — needs a furnace + fuel',
-    ActionName.PLACE: 'args: {"item": "<item>"}',
+    ActionName.PLACE: 'args: {"item": "<block>"} — building blocks only; tables/furnaces work from inventory',
     ActionName.FIGHT: 'args: {"target": "<mob>"}',
     ActionName.EAT: 'args: {"item": "<food>"}',
     ActionName.SLEEP: "args: {} — pass the night safely",
@@ -54,7 +54,8 @@ SELF_CORRECT_RULE = (
     "SELF-CORRECT: if LAST ACTION shows valid=false, DO NOT repeat that action. "
     "Read its reason and satisfy the missing prerequisite first (e.g. a furnace "
     "needs 8 cobblestone; a crafting_table needs 4 planks; planks come from wood). "
-    "Use canonical item names (planks, sticks, crafting_table, wooden_pickaxe)."
+    "Use canonical item names (planks, sticks, crafting_table, wooden_pickaxe). "
+    "A crafting_table and furnace work from your inventory — you do NOT need to place them."
 )
 
 # The one place the no-coordinate-leak rule is stated to the model (§3.2, §4.5).
