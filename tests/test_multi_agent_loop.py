@@ -17,8 +17,13 @@ from config import load_config
 from contracts import ExecutionMemory, Heuristic
 from contracts.enums import Role
 from obs_guard.coord_leak_test import assert_no_coord_leak
+from orca.cards import DEFAULT_ROSTER
 from orca.orca import Proposal
 from telemetry import init_telemetry
+
+# Roster ids the full-team loop actually uses (human-named; §4.1). Derived from the
+# roster so these tests don't re-pin the names.
+_ROSTER_IDS = [aid for aid, _role in DEFAULT_ROSTER]
 
 
 class AcceptingGate:
@@ -77,7 +82,7 @@ def test_four_llm_agents_play_full_episode(monkeypatch):
     (trace, metrics), = loop.run(settings, telemetry=init_telemetry(mode="off"))
 
     # 4 role-biased agents, all acting every round (env marks none busy here).
-    assert trace.agent_ids == ["agent_1", "agent_2", "agent_3", "agent_4"]
+    assert trace.agent_ids == _ROSTER_IDS
     assert trace.n_rounds == 4
     assert len(trace.action_records) == 4 * trace.n_rounds
     assert all(r.action.name.value == "scout" for r in trace.action_records)
@@ -145,7 +150,7 @@ def test_rejected_proposal_does_not_update_memory(monkeypatch):
     # Even with a nonzero coach learning_signal, a rejected proposal must NOT
     # mutate memory: end_episode_update is never even called.
     monkeypatch.setattr(loop, "build_llm", lambda role, settings: ConstLLM(_WORKER_JSON))
-    monkeypatch.setattr(loop, "_coach_signals", lambda proposal: {f"agent_{i}": 1.0 for i in range(1, 5)})
+    monkeypatch.setattr(loop, "_coach_signals", lambda proposal: {aid: 1.0 for aid in _ROSTER_IDS})
 
     calls: list = []
 
@@ -191,7 +196,7 @@ def test_accepted_proposal_allows_memory_update(monkeypatch):
     settings = _settings(t_max=2)
     settings.phases.phase0_length = 0
     loop.run(settings, telemetry=init_telemetry(mode="off"))
-    assert calls == ["agent_1", "agent_2", "agent_3", "agent_4"]
+    assert calls == _ROSTER_IDS
 
 
 # --------------------------------------------------------------------------- #
@@ -359,7 +364,7 @@ def test_memory_persists_into_next_episode(monkeypatch):
     # Invalid-action workers -> a NON-EMPTY accepted proposal -> the (positive)
     # signal bakes a learned heuristic into memory after episode 0.
     monkeypatch.setattr(loop, "AcceptGate", AcceptingGate)
-    monkeypatch.setattr(loop, "_coach_signals", lambda proposal: {f"agent_{i}": 1.0 for i in range(1, 5)})
+    monkeypatch.setattr(loop, "_coach_signals", lambda proposal: {aid: 1.0 for aid in _ROSTER_IDS})
     learned = Heuristic(condition="when blocked", action="scout before digging", confidence=0.7)
     monkeypatch.setattr(LLMWorker, "propose_memory", lambda self, digest: [learned])
 
@@ -484,7 +489,7 @@ def test_empty_proposal_with_scores_does_not_write_through_loop(monkeypatch):
     # Even though the gate accepts and a nonzero score is present, no write happens.
     monkeypatch.setattr(loop, "build_llm", lambda role, settings: ConstLLM(_WORKER_JSON))
     monkeypatch.setattr(loop, "AcceptGate", AcceptingGate)
-    monkeypatch.setattr(loop, "_coach_signals", lambda p: {f"agent_{i}": -0.7 for i in range(1, 5)})
+    monkeypatch.setattr(loop, "_coach_signals", lambda p: {aid: -0.7 for aid in _ROSTER_IDS})
     calls: list = []
 
     def spy(self, digest, learning_signal=0.0):
@@ -510,7 +515,7 @@ def test_negative_coach_signal_weakens_memory_through_loop(monkeypatch):
 
     def fake_signals(proposal):
         s = next(sigs, 0.0)
-        return {f"agent_{i}": s for i in range(1, 5)}
+        return {aid: s for aid in _ROSTER_IDS}
 
     monkeypatch.setattr(loop, "_coach_signals", fake_signals)
 

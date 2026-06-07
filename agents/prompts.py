@@ -47,6 +47,16 @@ ACTION_MENU: dict[ActionName, str] = {
     ActionName.WAIT: "args: {} — pass this turn (counts as idle)",
 }
 
+# Stated once to the model: act on the env's feedback instead of repeating a
+# rejected action. This is what breaks the craft-loop deadlock — an uninformed
+# worker re-issued the same invalid craft every round (§3.3, §4.4).
+SELF_CORRECT_RULE = (
+    "SELF-CORRECT: if LAST ACTION shows valid=false, DO NOT repeat that action. "
+    "Read its reason and satisfy the missing prerequisite first (e.g. a furnace "
+    "needs 8 cobblestone; a crafting_table needs 4 planks; planks come from wood). "
+    "Use canonical item names (planks, sticks, crafting_table, wooden_pickaxe)."
+)
+
 # The one place the no-coordinate-leak rule is stated to the model (§3.2, §4.5).
 NO_LEAK_RULES = (
     "NEVER write coordinates, numeric positions, exact distances (e.g. '40 blocks'), "
@@ -161,6 +171,21 @@ def _memory_block(memory: ExecutionMemory | None) -> str:
     return "\n".join(lines)
 
 
+def _last_action_line(obs: Observation) -> str:
+    """A salient one-liner on the previous action's outcome (§3.3/§4.4).
+
+    Rejected actions are called out loudly (with the env's reason) so the worker
+    fixes the prerequisite instead of repeating the illegal action — the obs JSON
+    already carries ``last_action``, but a plain-text callout is far more reliably
+    acted on by the model."""
+    la = getattr(obs, "last_action", None)
+    if la is None:
+        return "LAST ACTION: (none yet)"
+    if la.valid:
+        return f"LAST ACTION: {la.name} -> ok"
+    return f"LAST ACTION: {la.name} -> REJECTED ({la.reason or 'invalid'}). Do NOT repeat it; fix the cause first."
+
+
 def build_worker_prompt(
     obs: Observation,
     card: BehaviorCard,
@@ -177,6 +202,9 @@ def build_worker_prompt(
     """
     role = card.role if card is not None else (obs.self_view.role if obs else Role.MINER)
     primer = ROLE_PRIMERS.get(role, "You are a worker agent on a cooperative team.")
+    name = card.agent_id if card is not None else ""
+    if name:
+        primer = f"You are {name}. " + primer
 
     system = "\n\n".join(
         [
@@ -187,6 +215,7 @@ def build_worker_prompt(
             _action_spec(),
             _output_schema_spec(),
             "NO-LEAK RULES: " + NO_LEAK_RULES,
+            SELF_CORRECT_RULE,
         ]
     )
 
@@ -197,6 +226,7 @@ def build_worker_prompt(
             "== USER ==",
             "OBSERVATION (coordinate-free; the only thing you can perceive):",
             obs_json,
+            _last_action_line(obs),
             f"CURRENT ASSIGNMENT: {assignment}",
             f"TEAM DAG FRONTIER REACHED: {obs.dag_frontier_reached}",
             "HISTORY SUMMARY (older turns compacted; message content is never truncated):\n"
@@ -276,6 +306,7 @@ __all__ = [
     "ROLE_PRIMERS",
     "ACTION_MENU",
     "NO_LEAK_RULES",
+    "SELF_CORRECT_RULE",
     "DraftMessage",
     "WorkerOutput",
     "DraftHeuristic",

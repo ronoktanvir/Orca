@@ -251,7 +251,9 @@ def resolve_action(
         ok, reason = techtree.craft_check(item, agent.inventory)
         if not ok:
             return Resolution(_rec(round_idx, agent, action, False, reason))
-        recipe = techtree.RECIPES[item]
+        # craft_check accepts synonyms (e.g. "wooden_planks" -> "planks"); resolve
+        # to the canonical recipe key so the lookup + outputs match (§3.4).
+        recipe = techtree.RECIPES[techtree.canonical_item(item)]
         for nm, qty in recipe.inputs.items():
             agent.inventory[nm] -= qty
             if agent.inventory[nm] <= 0:

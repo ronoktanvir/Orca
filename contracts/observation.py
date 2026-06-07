@@ -77,6 +77,20 @@ class Landmark(BaseModel):
     distance_band: DistanceBand
 
 
+class LastActionView(BaseModel):
+    """Outcome of this agent's PREVIOUS action, fed back so the worker can self-
+    correct (§3.3). The env rejects invalid actions with a reason; surfacing that
+    reason here is what stops an uninformed worker from repeating an illegal craft
+    forever (the observed craft-loop deadlock). Coordinate-free: only the action
+    name + validity + a short, scrubbed reason — never args/coordinates."""
+
+    model_config = _STRICT
+
+    name: str
+    valid: bool
+    reason: Optional[str] = None
+
+
 class Observation(BaseModel):
     """The full coordinate-free observation handed to a worker each turn."""
 
@@ -93,6 +107,10 @@ class Observation(BaseModel):
     recent_messages: list[Message] = Field(default_factory=list)
     assignment: str = ""
     dag_frontier_reached: str = "start"  # team progress so far (shared signal)
+    # Outcome of this agent's previous action (None on the first round). The env
+    # is the source of truth for validity; feeding the rejection reason back lets
+    # the worker fix the missing prerequisite instead of looping (§3.3).
+    last_action: Optional[LastActionView] = None
 
 
 __all__ = [
@@ -102,4 +120,5 @@ __all__ = [
     "HereView",
     "TeammateView",
     "Landmark",
+    "LastActionView",
 ]
