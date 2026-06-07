@@ -51,7 +51,10 @@ class RunConfig(BaseModel):
     stop_at_milestone: Optional[str] = "iron"  # Phase 0 shallow target
     message_window: int = 8
     single_agent_oracle: bool = True  # Phase 0 uses the scripted oracle
-    worker_concurrency: int = 1  # >1 => run a round's worker calls concurrently (threads)
+    # 0 => AUTO: one worker call per agent each round, so the full 4-agent team
+    # runs its calls concurrently (asyncio) while the single-agent oracle stays
+    # sequential. A positive int pins the concurrency explicitly (tests/eval).
+    worker_concurrency: int = 0
 
 
 class AgentsConfig(BaseModel):

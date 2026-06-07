@@ -19,6 +19,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -68,6 +69,9 @@ class Telemetry:
         self.run_id = run_id
         self.dir: Optional[Path] = None
         self._events_path: Optional[Path] = None
+        # Serializes the local-JSONL writes so the concurrent (asyncio) worker
+        # path can log from worker threads without interleaving lines (§5/§10).
+        self._write_lock = threading.Lock()
         if backend_mode != "noop" and run_dir is not None:
             self.dir = Path(run_dir) / run_id
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -77,8 +81,9 @@ class Telemetry:
         if self._events_path is None:
             return
         record = {"ts": _now_stamp(), "event": name, **data}
-        with self._events_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, default=str) + "\n")
+        line = json.dumps(record, default=str) + "\n"
+        with self._write_lock, self._events_path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
 
     def log_episode(self, trace: Any, metrics: Any) -> Optional[Path]:
         """Write an episode's trace + metrics as JSON; return the path (or None)."""

@@ -29,6 +29,23 @@ def test_transferable_heuristics_are_kept():
     assert not looks_seed_specific("craft stone pickaxe before mining iron")
 
 
+def test_integer_coordinate_pairs_detected_ids_preserved():
+    # Bare integer coordinate-like pairs the float pattern misses must be caught...
+    assert looks_seed_specific("base at 12, 3")
+    assert looks_seed_specific("waypoint 12;3")
+    assert looks_seed_specific("go to -4, 7")
+    # ...without flagging legitimate agent ids or lone counts.
+    assert not looks_seed_specific("agent_2")
+    assert not looks_seed_specific("hand off to agent_12")
+    assert not looks_seed_specific("gather 6 ingots")
+
+
+def test_scrub_removes_integer_pairs_but_keeps_meaning():
+    cleaned = scrub_seed_specific("iron cache at 12, 3 to the north")
+    assert not looks_seed_specific(cleaned)
+    assert "iron" in cleaned and "north" in cleaned
+
+
 def test_guard_filter_drops_only_leaky_rules():
     mem = ExecutionMemory(
         agent_id="agent_2",
