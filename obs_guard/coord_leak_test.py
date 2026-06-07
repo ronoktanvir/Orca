@@ -123,4 +123,43 @@ def test_scanner_catches_a_planted_leak():
     assert any("coordinates" in s or "float pair" in s for s in leaks)
 
 
+# --------------------------------------------------------------------------- #
+# E2: the richer observation (landmarks, mobs, layer transitions) must stay clean
+# --------------------------------------------------------------------------- #
+def test_rich_obs_with_landmarks_and_mobs_no_leak():
+    # Reveal a neighbor that carries a lava_pool (populates known_landmarks) and
+    # observe at night (populates mobs) — the richer obs must not leak coords.
+    from env.observation import serialize_observation
+    from env.world import AgentState
+
+    world = make_world("A")
+    world.add_agent(AgentState(agent_id="a", role=Role.MINER, region_id="r_00"))
+    world.regions["r_07"].discovered = True  # caves w/ lava_pool, neighbor of start
+    obs = serialize_observation(world, "a", round_idx=60, day_length=100)  # round 60 -> night
+    assert obs.known_landmarks, "landmarks should be populated (test is real)"
+    assert obs.here.mobs, "night mobs should be populated (test is real)"
+    assert_no_coord_leak(obs)
+
+
+def test_obs_in_nether_after_portal_no_leak():
+    # Build+light+enter a nether portal, then observe in the Nether (new layer
+    # state + nether mob path) — still coordinate-clean.
+    from random import Random
+
+    from contracts import Action
+    from contracts.enums import ActionName
+    from env.actions import resolve_action
+    from env.observation import serialize_observation
+    from env.world import AgentState
+
+    world = make_world("A")
+    agent = AgentState(agent_id="a", role=Role.TINKERER, region_id="r_00", inventory={"nether_portal": 1})
+    world.add_agent(agent)
+    resolve_action(world, agent, Action(name=ActionName.PLACE, args={"item": "nether_portal"}), Random(0), 0)
+    resolve_action(world, agent, Action(name=ActionName.MOVE, args={"to": "nether"}), Random(0), 1)
+    obs = serialize_observation(world, "a", round_idx=1, day_length=100)
+    assert obs.self_view.layer.value == "nether"
+    assert_no_coord_leak(obs)
+
+
 __all__ = ["scan_for_leaks", "assert_no_coord_leak"]

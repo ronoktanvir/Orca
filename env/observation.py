@@ -19,10 +19,10 @@ from contracts import (
     SelfView,
     TeammateView,
 )
-from contracts.enums import Milestone, TimeOfDay
+from contracts.enums import Layer, Milestone, Structure, TimeOfDay
 
 if TYPE_CHECKING:  # avoid import cycle at runtime; type-only
-    from .world import World
+    from .world import Region, World
 
 
 def time_of_day(round_idx: int, day_length: int) -> TimeOfDay:
@@ -35,6 +35,21 @@ def time_of_day(round_idx: int, day_length: int) -> TimeOfDay:
     if phase < 0.95:
         return TimeOfDay.NIGHT
     return TimeOfDay.DAWN
+
+
+def perceived_mobs(region: "Region", tod: TimeOfDay) -> list[str]:
+    """Mobs visible in a region this round (§3.2) — perception only; combat is
+    E4/E5. Deterministic from layer/structure/time (no RNG)."""
+    if region.layer == Layer.END:
+        return ["ender_dragon"]
+    if region.structure == Structure.FORTRESS:
+        return ["blaze"]
+    if region.layer == Layer.NETHER:
+        return ["piglin"]
+    # Overworld: hostile mobs only at night (riskier — wired into combat in E4).
+    if tod == TimeOfDay.NIGHT:
+        return ["zombie"]
+    return []
 
 
 def serialize_observation(
@@ -56,6 +71,7 @@ def serialize_observation(
     """
     agent = world.agents[agent_id]
     region = world.region_of(agent_id)
+    tod = time_of_day(round_idx, day_length)
 
     self_view = SelfView(
         role=agent.role,
@@ -67,10 +83,23 @@ def serialize_observation(
         layer=region.layer,
     )
 
+    # mobs / landmarks default to env-derived perception (coord-free); callers may
+    # still inject overrides (e.g. tests). Landmarks come from the world's
+    # bearing/band helpers — never ``Region.pos`` — so the coord-leak guard holds.
+    mob_list = mobs if mobs is not None else perceived_mobs(region, tod)
+    landmark_list = (
+        landmarks
+        if landmarks is not None
+        else [
+            Landmark(type=ltype, rel_dir=bearing, distance_band=band)
+            for (ltype, bearing, band) in world.perceived_landmarks(region.id)
+        ]
+    )
+
     here = HereView(
         resources_visible=sorted(region.resources.keys()) if region.discovered else [],
         structure=region.structure if region.discovered else None,
-        mobs=list(mobs or []),
+        mobs=list(mob_list),
         exits=[
             Exit(dir=bearing, distance_band=band, biome_hint=hint)
             for (bearing, band, hint) in world.exits_of(region.id)
@@ -85,15 +114,15 @@ def serialize_observation(
 
     return Observation(
         round=round_idx,
-        time_of_day=time_of_day(round_idx, day_length),
+        time_of_day=tod,
         self=self_view,
         here=here,
         teammates=teammates,
-        known_landmarks=list(landmarks or []),
+        known_landmarks=list(landmark_list),
         recent_messages=list(recent_messages or []),
         assignment=assignment,
         dag_frontier_reached=frontier.value,
     )
 
 
-__all__ = ["serialize_observation", "time_of_day"]
+__all__ = ["serialize_observation", "time_of_day", "perceived_mobs"]

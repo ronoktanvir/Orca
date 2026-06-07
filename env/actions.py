@@ -19,7 +19,7 @@ from random import Random
 from typing import Optional
 
 from contracts import Action, ActionRecord, Message
-from contracts.enums import ActionName, Bearing, MessageType
+from contracts.enums import ActionName, Bearing, Layer, MessageType
 
 from . import techtree
 from .world import AgentState, World
@@ -108,7 +108,23 @@ def resolve_action(
 
     # --- move -------------------------------------------------------------- #
     if name == ActionName.MOVE:
-        raw = args.get("direction") or args.get("dir")
+        raw = args.get("direction") or args.get("dir") or args.get("to")
+        # Cross-layer portal travel (§3.1) — explicit, since neighbors never cross
+        # layers. Triggered by a portal/layer keyword instead of a compass bearing.
+        if isinstance(raw, str) and raw.lower() in ("portal", "nether", "end", "overworld"):
+            dest = world.portal_destination(agent.region_id)
+            if dest is None:
+                return Resolution(_rec(round_idx, agent, action, False, "no active portal here"))
+            agent.region_id = dest
+            arrived = world.regions[dest]
+            arrived.discovered = True
+            return Resolution(
+                _rec(
+                    round_idx, agent, action, True,
+                    result={"used_portal": True, "arrived_layer": arrived.layer.value,
+                            "arrived_biome": arrived.biome.value},
+                )
+            )
         if raw is None:
             return Resolution(_rec(round_idx, agent, action, False, "move needs a direction"))
         try:
@@ -199,11 +215,45 @@ def resolve_action(
             _rec(round_idx, agent, action, True, result={"smelted": {output: 1}})
         )
 
-    # --- place (put a block into the world; e.g. obsidian portal frame) ----- #
+    # --- place (deploy a block / light a portal into the world; §3.1, §3.4) - #
     if name == ActionName.PLACE:
         item = str(args.get("item", args.get("block", "")))
         if not item:
             return Resolution(_rec(round_idx, agent, action, False, "place needs an item"))
+
+        # Lighting a nether portal links this Overworld region to the Nether entry.
+        if item == "nether_portal":
+            if agent.inventory.get("nether_portal", 0) <= 0:
+                return Resolution(_rec(round_idx, agent, action, False, "no nether_portal to place"))
+            if region.layer != Layer.OVERWORLD:
+                return Resolution(
+                    _rec(round_idx, agent, action, False, "a nether portal must be lit in the Overworld")
+                )
+            ok, reason = world.light_nether_portal(region.id)
+            if not ok:
+                return Resolution(_rec(round_idx, agent, action, False, reason))
+            agent.inventory["nether_portal"] -= 1
+            if agent.inventory["nether_portal"] <= 0:
+                del agent.inventory["nether_portal"]
+            return Resolution(
+                _rec(round_idx, agent, action, True, result={"lit_portal": "nether"})
+            )
+
+        # Activating the End portal (only in the stronghold) links to the End.
+        if item == "end_portal":
+            if agent.inventory.get("end_portal", 0) <= 0:
+                return Resolution(_rec(round_idx, agent, action, False, "no end_portal to place"))
+            ok, reason = world.activate_end_portal(region.id)
+            if not ok:
+                return Resolution(_rec(round_idx, agent, action, False, reason))
+            agent.inventory["end_portal"] -= 1
+            if agent.inventory["end_portal"] <= 0:
+                del agent.inventory["end_portal"]
+            return Resolution(
+                _rec(round_idx, agent, action, True, result={"activated_end_portal": True})
+            )
+
+        # Otherwise: a plain building block (e.g. obsidian for a portal frame).
         if item not in techtree.PLACEABLE_BLOCKS:
             return Resolution(
                 _rec(round_idx, agent, action, False, f"cannot place '{item}'")
@@ -215,7 +265,7 @@ def resolve_action(
         agent.inventory[item] -= 1
         if agent.inventory[item] <= 0:
             del agent.inventory[item]
-        # TODO E2: attach the placed block to region world-state (portal frame).
+        # TODO E2+: track placed frame blocks in region world-state (count to 10).
         return Resolution(_rec(round_idx, agent, action, True, result={"placed": item}))
 
     # --- deferred to E4 (survival) / E5 (co-op) --------------------------- #
