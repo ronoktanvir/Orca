@@ -205,4 +205,10 @@ def make_world(seed: str = "A") -> World:
     )
 
 
-__all__ = ["make_world", "TRAIN_SEEDS", "HELDOUT_SEEDS", "ALL_SEEDS"]
+#: Clean per-seed generator entry point (§3.7). Alias of :func:`make_world`; the
+#: full layout (graph, positions, abundances, structures, layer anchors) is a pure
+#: deterministic function of the seed string.
+generate = make_world
+
+
+__all__ = ["make_world", "generate", "TRAIN_SEEDS", "HELDOUT_SEEDS", "ALL_SEEDS"]

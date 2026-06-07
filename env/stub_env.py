@@ -178,7 +178,9 @@ class StubEnv:
                 result.messages.append(res.message)
 
         # Update the (monotonic) max team frontier and timeline.
-        detected = techtree.detect_milestone(self.world.pooled_inventory())
+        detected = techtree.detect_frontier(
+            self.world.pooled_inventory(), self.world.world_milestones
+        )
         if _depth(detected) > _depth(self.frontier):
             self.frontier = detected
             event = MilestoneEvent(milestone=detected, round=self.round_idx)

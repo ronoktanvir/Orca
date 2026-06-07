@@ -18,7 +18,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
-from contracts.enums import Bearing, Biome, DistanceBand, Layer, Role, Structure
+from contracts.enums import Bearing, Biome, DistanceBand, Layer, Milestone, Role, Structure
 
 # Geometry thresholds (env-internal; never emitted).
 _BAND_ADJACENT = 1.5
@@ -123,6 +123,11 @@ class World:
         self.end_region_id = end_region_id
         self.stronghold_id = stronghold_id
         self.agents: dict[str, AgentState] = {}
+        # Location/world-state milestones achieved this episode (§3.4). These are
+        # the milestones that inventory alone can't prove (a fortress discovered,
+        # the Nether entered, the dragon slain); detect_frontier folds them into
+        # the team frontier. Set by actions.py on discovery/arrival/combat.
+        self.world_milestones: set[Milestone] = set()
 
     # -- agent management --------------------------------------------------- #
     def add_agent(self, agent: AgentState) -> None:
@@ -217,6 +222,25 @@ class World:
             for name, qty in agent.inventory.items():
                 pooled[name] = pooled.get(name, 0) + qty
         return pooled
+
+    # -- discovery / arrival milestone bookkeeping (§3.4) ------------------- #
+    def discover(self, region_id: str) -> None:
+        """Mark a region discovered and record any structure milestone it reveals."""
+        region = self.regions[region_id]
+        region.discovered = True
+        if region.structure == Structure.FORTRESS:
+            self.world_milestones.add(Milestone.FORTRESS_FOUND)
+        elif region.structure == Structure.STRONGHOLD:
+            self.world_milestones.add(Milestone.STRONGHOLD_FOUND)
+
+    def enter(self, region_id: str) -> None:
+        """Record an agent arriving in a region (discovery + layer-entry milestones)."""
+        self.discover(region_id)
+        layer = self.regions[region_id].layer
+        if layer == Layer.NETHER:
+            self.world_milestones.add(Milestone.NETHER_ENTERED)
+        elif layer == Layer.END:
+            self.world_milestones.add(Milestone.END_ENTERED)
 
     # -- cross-layer transitions (§3.1; explicit — neighbors won't cross layers) - #
     def light_nether_portal(self, region_id: str) -> tuple[bool, Optional[str]]:

@@ -19,20 +19,34 @@ from random import Random
 from typing import Optional
 
 from contracts import Action, ActionRecord, Message
-from contracts.enums import ActionName, Bearing, Layer, MessageType
+from contracts.enums import ActionName, Bearing, Biome, Layer, Milestone, MessageType, Structure
 
 from . import techtree
 from .world import AgentState, World
 
-# Actions still deferred (rejected + validly logged). E1 implements SMELT + PLACE
-# below; FIGHT/EAT/SLEEP/GIVE_ITEM/REGROUP land in E4 (survival) / E5 (co-op).
+# Actions still deferred (rejected + validly logged). E1 added SMELT + PLACE; E3
+# adds a minimal deterministic FIGHT (below) so the full-DAG oracle can prove
+# winnability; EAT/SLEEP/GIVE_ITEM/REGROUP land in E4 (survival) / E5 (co-op).
 _UNSUPPORTED = {
-    ActionName.FIGHT,
     ActionName.EAT,
     ActionName.SLEEP,
     ActionName.GIVE_ITEM,
     ActionName.REGROUP,
 }
+
+# Mob -> (drop item, location predicate, human reason if location is wrong).
+# E3-minimal: deterministic, single-agent, always-succeeds. E4 adds stochastic
+# (~Binomial) yields + risk; E5 makes blaze/dragon superadditive (co-located gear).
+def _fight_blaze_ok(region) -> bool:
+    return region.structure == Structure.FORTRESS
+
+
+def _fight_enderman_ok(region) -> bool:
+    return region.layer == Layer.NETHER or region.biome == Biome.WARPED_FOREST
+
+
+def _fight_dragon_ok(region) -> bool:
+    return region.layer == Layer.END
 
 # Macro-actions that count as "idle" for the idle-fraction penalty (§7.2).
 IDLE_ACTIONS = {ActionName.WAIT}
@@ -116,8 +130,8 @@ def resolve_action(
             if dest is None:
                 return Resolution(_rec(round_idx, agent, action, False, "no active portal here"))
             agent.region_id = dest
+            world.enter(dest)  # discover + record NETHER_ENTERED / END_ENTERED
             arrived = world.regions[dest]
-            arrived.discovered = True
             return Resolution(
                 _rec(
                     round_idx, agent, action, True,
@@ -137,7 +151,7 @@ def resolve_action(
                 _rec(round_idx, agent, action, False, f"no region toward {direction.value}")
             )
         agent.region_id = dest
-        world.regions[dest].discovered = True
+        world.enter(dest)  # discover + record any arrival/structure milestone
         arrived = world.regions[dest]
         return Resolution(
             _rec(
@@ -151,10 +165,10 @@ def resolve_action(
 
     # --- scout ------------------------------------------------------------- #
     if name == ActionName.SCOUT:
-        region.discovered = True
+        world.discover(region.id)
         revealed = []
         for rid, _dist in world.neighbors(agent.region_id):
-            world.regions[rid].discovered = True
+            world.discover(rid)  # reveals biome + any structure milestone
             revealed.append(world.regions[rid].biome.value)
         return Resolution(
             _rec(round_idx, agent, action, True, result={"scouted_biomes": revealed})
@@ -235,6 +249,7 @@ def resolve_action(
             agent.inventory["nether_portal"] -= 1
             if agent.inventory["nether_portal"] <= 0:
                 del agent.inventory["nether_portal"]
+            world.world_milestones.add(Milestone.PORTAL_BUILT)
             return Resolution(
                 _rec(round_idx, agent, action, True, result={"lit_portal": "nether"})
             )
@@ -249,6 +264,7 @@ def resolve_action(
             agent.inventory["end_portal"] -= 1
             if agent.inventory["end_portal"] <= 0:
                 del agent.inventory["end_portal"]
+            world.world_milestones.add(Milestone.END_PORTAL_ACTIVE)
             return Resolution(
                 _rec(round_idx, agent, action, True, result={"activated_end_portal": True})
             )
@@ -267,6 +283,32 @@ def resolve_action(
             del agent.inventory[item]
         # TODO E2+: track placed frame blocks in region world-state (count to 10).
         return Resolution(_rec(round_idx, agent, action, True, result={"placed": item}))
+
+    # --- fight (E3-minimal: deterministic; E4 adds risk, E5 superadditive) -- #
+    if name == ActionName.FIGHT:
+        target = str(args.get("target", args.get("mob", ""))).lower()
+        if target == "blaze":
+            if not _fight_blaze_ok(region):
+                return Resolution(_rec(round_idx, agent, action, False, "blaze are only in a fortress"))
+            agent.inventory["blaze_rod"] = agent.inventory.get("blaze_rod", 0) + 1
+            return Resolution(
+                _rec(round_idx, agent, action, True, result={"defeated": "blaze", "drop": {"blaze_rod": 1}})
+            )
+        if target == "enderman":
+            if not _fight_enderman_ok(region):
+                return Resolution(_rec(round_idx, agent, action, False, "no enderman here"))
+            agent.inventory["ender_pearl"] = agent.inventory.get("ender_pearl", 0) + 1
+            return Resolution(
+                _rec(round_idx, agent, action, True, result={"defeated": "enderman", "drop": {"ender_pearl": 1}})
+            )
+        if target in ("ender_dragon", "dragon"):
+            if not _fight_dragon_ok(region):
+                return Resolution(_rec(round_idx, agent, action, False, "the dragon is only in the End"))
+            world.world_milestones.add(Milestone.DRAGON_DEFEATED)
+            return Resolution(
+                _rec(round_idx, agent, action, True, result={"defeated": "ender_dragon", "win": True})
+            )
+        return Resolution(_rec(round_idx, agent, action, False, f"cannot fight '{target or '?'}'"))
 
     # --- deferred to E4 (survival) / E5 (co-op) --------------------------- #
     if name in _UNSUPPORTED:

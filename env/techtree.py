@@ -373,6 +373,26 @@ def detect_milestone(pooled_inventory: dict[str, int]) -> Milestone:
     return reached
 
 
+_MILESTONE_DEPTH = {m: i for i, m in enumerate(Milestone)}
+
+
+def detect_frontier(
+    pooled_inventory: dict[str, int], world_milestones: set[Milestone] | None = None
+) -> Milestone:
+    """Deepest team milestone from pooled inventory PLUS world-state milestones.
+
+    Inventory milestones come from :func:`detect_milestone` (E1). World/location
+    milestones (Nether entered, fortress/stronghold found, End portal active, End
+    entered, dragon defeated) can't be read from inventory, so the env records
+    them on ``World.world_milestones`` (E2/E3) and passes them here. Returns the
+    deepest of the two (max-frontier, §7.1)."""
+    best = detect_milestone(pooled_inventory)
+    for m in world_milestones or ():
+        if _MILESTONE_DEPTH[m] > _MILESTONE_DEPTH[best]:
+            best = m
+    return best
+
+
 __all__ = [
     "RESOURCES",
     "FIGHT_DROPS",
@@ -390,4 +410,5 @@ __all__ = [
     "craft_check",
     "smelt_check",
     "detect_milestone",
+    "detect_frontier",
 ]
