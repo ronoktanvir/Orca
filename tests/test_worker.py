@@ -8,10 +8,14 @@ from __future__ import annotations
 from agents.memory import looks_seed_specific
 from agents.prompts import build_worker_prompt
 from agents.worker import LLMWorker
-from contracts import BehaviorCard, ExecutionMemory, Heuristic
+from contracts import BehaviorCard, ExecutionMemory, Heuristic, Message
 from contracts.enums import ActionName, MessageType, Role
 from obs_guard import scan_for_leaks
 from tests.fixtures import sample_behavior_card, sample_execution_memory, sample_observation
+
+
+def _msg(frm, to, content, rnd=0, type=MessageType.REPORT):
+    return Message(**{"from": frm}, to=to, type=type, content=content, urgency=0.3, round=rnd)
 
 
 class ScriptedLLM:
@@ -148,6 +152,136 @@ def test_report_action_content_scrubbed():
     action = w.act(sample_observation())
     assert action.name == ActionName.REPORT
     assert not looks_seed_specific(action.args["content"])  # env-bound message stays clean
+
+
+# --------------------------------------------------------------------------- #
+# A4/§3.2 — the message RECIPIENT (`to`) is a leak vector too: validate it.
+# --------------------------------------------------------------------------- #
+def test_draft_message_region_id_recipient_defaults_to_team():
+    # A model emits a clean content but a leaky region-id recipient.
+    out = '{"action":{"name":"wait"},"messages":[{"to":"r_07","type":"report","content":"clean"}]}'
+    w = _worker([out])
+    w.act(sample_observation())
+    assert len(w.pending_messages) == 1
+    msg = w.pending_messages[0]
+    assert msg.to == "team"            # leaky recipient downgraded, never reaches Message.to
+    assert msg.content == "clean"      # content preserved
+    assert scan_for_leaks(msg.model_dump(by_alias=True)) == []
+
+
+def test_draft_message_coordinate_recipient_defaults_to_team():
+    out = '{"action":{"name":"wait"},"messages":[{"to":"12, 3","content":"hi"}]}'
+    w = _worker([out])
+    w.act(sample_observation())
+    assert w.pending_messages[0].to == "team"
+
+
+def test_draft_message_valid_agent_recipient_preserved():
+    out = '{"action":{"name":"wait"},"messages":[{"to":"agent_3","content":"for you"}]}'
+    w = _worker([out])
+    w.act(sample_observation())
+    assert w.pending_messages[0].to == "agent_3"   # legitimate agent id kept
+
+
+def test_report_action_leaky_recipient_downgraded_not_nuked():
+    # A leaky `to` on a report action downgrades to team rather than nuking the
+    # whole report to wait (the content is still useful coordination).
+    out = '{"action":{"name":"report","args":{"content":"need help","to":"r_07"}}}'
+    w = _worker([out])
+    action = w.act(sample_observation())
+    assert action.name == ActionName.REPORT
+    assert action.args["to"] == "team"
+    assert scan_for_leaks(action.model_dump()) == []
+
+
+# --------------------------------------------------------------------------- #
+# A4/§5.2 — older messages are summarized into history; recent stays full.
+# --------------------------------------------------------------------------- #
+def _wait_worker(agent_id="agent_2"):
+    w = LLMWorker(agent_id, ScriptedLLM([], default='{"action":{"name":"wait"}}'),
+                  sample_behavior_card(), sample_execution_memory())
+    return w
+
+
+def test_older_messages_appear_in_history_summary():
+    w = _wait_worker()
+    base = sample_observation()
+    msg_a = _msg("agent_9", "team", "found caves to the N", rnd=0)
+    obs1 = base.model_copy(update={"round": 1, "recent_messages": [msg_a]})
+    obs2 = base.model_copy(update={"round": 2, "recent_messages": []})  # msg_a scrolled out
+    w.act(obs1)
+    w.act(obs2)
+    assert "messages:" in w.history_summary
+    assert "agent_9" in w.history_summary   # older message activity represented
+
+
+def test_live_message_not_yet_summarized_no_double_count():
+    # While a message is still live in the window it is NOT also folded into the
+    # history summary (recent + summarized stay disjoint).
+    w = _wait_worker()
+    base = sample_observation()
+    msg_a = _msg("agent_9", "team", "still here", rnd=0)
+    obs1 = base.model_copy(update={"round": 1, "recent_messages": [msg_a]})
+    obs2 = base.model_copy(update={"round": 2, "recent_messages": [msg_a]})  # still live
+    w.act(obs1)
+    w.act(obs2)
+    assert "messages:" not in w.history_summary  # never summarized while live
+
+
+def test_history_summary_is_leak_free():
+    w = _wait_worker()
+    base = sample_observation()
+    leaky = _msg("agent_9", "team", "cache at 12, 3 near r_07", rnd=0)
+    obs1 = base.model_copy(update={"round": 1, "recent_messages": [leaky]})
+    obs2 = base.model_copy(update={"round": 2, "recent_messages": []})
+    w.act(obs1)
+    w.act(obs2)
+    assert not looks_seed_specific(w.history_summary)
+    assert "r_07" not in w.history_summary
+
+
+# --------------------------------------------------------------------------- #
+# A6/§4.1 — the no-card seam preserves the roster role.
+# --------------------------------------------------------------------------- #
+def test_role_kwarg_sets_default_card_role():
+    for role in (Role.EXPLORER, Role.MINER, Role.TINKERER, Role.SUPPORT):
+        w = LLMWorker("agent_1", ScriptedLLM([]), role=role)  # no card supplied
+        assert w.role == role
+        prompt = build_worker_prompt(sample_observation(), w.card, w.memory)
+        assert role.value.capitalize() in prompt  # role primer matches
+
+
+# --------------------------------------------------------------------------- #
+# A5/§4.5 — episode-end memory write driven by the (coach) learning_signal.
+# --------------------------------------------------------------------------- #
+def test_neutral_signal_skips_memory_llm_call():
+    mem = ExecutionMemory(agent_id="agent_2", heuristics=[])
+    w = LLMWorker("agent_2", ScriptedLLM([]), sample_behavior_card(), mem)
+    w.end_episode_update("digest", learning_signal=0.0)
+    assert w.llm.calls == 0          # ~0 signal -> no memory-proposal LLM call
+    assert w.memory.heuristics == []  # and no change
+
+
+def test_negative_signal_weakens_existing_heuristic():
+    # A negative coach signal weakens the agent's OWN current heuristics — without
+    # an LLM call (it doesn't rely on the 'propose good how-to' LLM re-surfacing the
+    # rule to drop). This is the reachable, effective negative path.
+    existing = Heuristic(condition="mine without scouting", action="dig straight down", confidence=0.9)
+    mem = ExecutionMemory(agent_id="agent_2", heuristics=[existing])
+    w = LLMWorker("agent_2", ScriptedLLM([]), sample_behavior_card(), mem)
+    w.end_episode_update("digest", learning_signal=-0.5)
+    assert len(w.memory.heuristics) == 1
+    assert w.memory.heuristics[0].confidence < 0.9   # weakened
+    assert w.llm.calls == 0                           # negative path needs no LLM
+
+
+def test_strongly_negative_signal_removes_existing_heuristic():
+    existing = Heuristic(condition="rush the nether", action="skip armor", confidence=0.3)
+    mem = ExecutionMemory(agent_id="agent_2", heuristics=[existing])
+    w = LLMWorker("agent_2", ScriptedLLM([]), sample_behavior_card(), mem)
+    w.end_episode_update("digest", learning_signal=-1.0)
+    assert w.memory.heuristics == []   # weakened below the floor -> removed
+    assert w.llm.calls == 0
 
 
 # --------------------------------------------------------------------------- #

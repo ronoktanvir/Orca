@@ -25,9 +25,11 @@ from __future__ import annotations
 from statistics import median
 from typing import Callable, Optional
 
+from agents.memory import looks_seed_specific, sanitize_action_args, scrub_seed_specific
 from agents.scripted import ShallowOracle
 from agents.worker import LLMWorker
 from bus import CommBus
+from bus.messages import normalize_recipient
 from config import OrcaSettings, load_config
 from contracts import EpisodeMetrics, EpisodeTrace, ExecutionMemory, Message, Observation
 from contracts.enums import Milestone, Role
@@ -68,6 +70,98 @@ def _merge_bus_messages(
     return obs.model_copy(update={"recent_messages": combined})
 
 
+def _effective_concurrency(settings: OrcaSettings, n_agents: int) -> int:
+    """Resolve this round's worker-call concurrency (§5 'async parallel').
+
+    An explicit ``run.worker_concurrency > 0`` wins. Otherwise AUTO: one worker
+    call per agent — so the single-agent oracle (``n_agents == 1``) stays
+    sequential/Weave-safe and the full 4-agent team runs its calls concurrently.
+    """
+    c = getattr(settings.run, "worker_concurrency", 0) or 0
+    if c > 0:
+        return c
+    return max(1, n_agents)
+
+
+def _act_async(obs_by: list, concurrency: int) -> list:
+    """Run each worker's sync ``act`` concurrently via ``asyncio.to_thread`` and
+    return results in roster order (§4.2/§5).
+
+    ``asyncio.gather`` preserves input order, so action assembly stays
+    deterministic regardless of which worker finishes first. A semaphore bounds
+    the in-flight calls to ``concurrency``."""
+    import asyncio
+
+    async def _run() -> list:
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def _one(agent, obs):
+            async with sem:
+                return await asyncio.to_thread(agent.act, obs)
+
+        return await asyncio.gather(*[_one(a, o) for a, o in obs_by])
+
+    return asyncio.run(_run())
+
+
+def _act_round(obs_by: list, concurrency: int) -> list:
+    """Collect one round's actions, concurrently when ``concurrency > 1``.
+
+    Sequential path keeps the ``@op``-wrapped ``worker_turn`` so Weave spans nest
+    (§10). The concurrent path calls ``agent.act`` directly off the main thread
+    (Weave op context-vars don't cross threads). We detect an already-running event
+    loop *up front* and use a thread pool then — rather than catching a RuntimeError
+    from ``asyncio.run``, which would also swallow a RuntimeError raised inside a
+    worker's ``act`` and re-run every worker (double side effects)."""
+    if concurrency > 1 and len(obs_by) > 1:
+        import asyncio
+
+        try:
+            asyncio.get_running_loop()
+            in_loop = True
+        except RuntimeError:
+            in_loop = False
+        if in_loop:  # asyncio.run would raise here -> thread-pool bridge instead
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=min(concurrency, len(obs_by))) as ex:
+                return list(ex.map(lambda ao: ao[0].act(ao[1]), obs_by))
+        return _act_async(obs_by, concurrency)
+    return [worker_turn(agent, obs) for agent, obs in obs_by]
+
+
+def _sanitize_bus_message(msg: Message) -> Optional[Message]:
+    """Recipient-validate + content-scrub a message before it rides the bus (§3.2).
+
+    Defense in depth for ANY message reaching the bus — worker-emitted drafts AND
+    env-emitted ``report`` / ``request_help`` messages — so a custom worker_factory
+    worker cannot leak through a raw pending message. The recipient is normalized
+    (``team`` / ``orca`` / ``agent_<n>`` only) and coordinate-like content scrubbed.
+    Returns ``None`` if nothing is left to say after scrubbing (the message is then
+    dropped)."""
+    content = msg.content
+    if looks_seed_specific(content):
+        content = scrub_seed_specific(content)
+    if not content.strip():
+        return None
+    to = normalize_recipient(msg.to)
+    if to == msg.to and content == msg.content:
+        return msg
+    return msg.model_copy(update={"to": to, "content": content})
+
+
+def _drain_env_messages(env: StubEnv, bus: CommBus, telemetry: Telemetry) -> None:
+    """Move this round's env-created messages onto the one authoritative bus for
+    t+1 delivery, clearing the env's internal queue so it never *also* delivers
+    them (single bus path; fixes the report/request_help t+2 delay, §5.2)."""
+    for msg in env.drain_posted():
+        safe = _sanitize_bus_message(msg)
+        if safe is None:
+            continue
+        bus.post(safe)
+        telemetry.log_event("message", safe.model_dump(by_alias=True))
+
+
 def _round_actions(
     agents: list,
     env: StubEnv,
@@ -76,14 +170,15 @@ def _round_actions(
     concurrency: int,
     *,
     bus: Optional[CommBus] = None,
-    bus_messages: Optional[list[Message]] = None,
 ) -> dict:
     """Collect one round's actions.
 
     Observation is sequential (reads world state); worker calls can run
     concurrently across agents when ``concurrency > 1``. If a comm bus is present,
     messages posted last round are delivered before observation, and this round's
-    worker-emitted messages are posted for t+1 delivery.
+    worker-emitted (draft) messages are posted for t+1 delivery. Action-level
+    ``report`` / ``request_help`` messages are drained onto the same bus after the
+    env step (see :func:`_drain_env_messages`) — one authoritative path.
     """
     if bus is not None:
         bus.tick()
@@ -96,19 +191,15 @@ def _round_actions(
         obs_snapshots.append(obs.model_dump(mode="json", by_alias=True))
         obs_by.append((agent, obs))
 
-    if concurrency and concurrency > 1 and len(obs_by) > 1:
-        from concurrent.futures import ThreadPoolExecutor
-
-        # Call agent.act directly (not the @op-wrapped worker_turn): Weave's op
-        # context-vars don't cross threads, so wrapping here could raise in weave
-        # mode and the spans wouldn't nest anyway. The sequential path keeps @op.
-        with ThreadPoolExecutor(max_workers=min(concurrency, len(obs_by))) as ex:
-            results = list(ex.map(lambda ao: ao[0].act(ao[1]), obs_by))
-    else:
-        results = [worker_turn(agent, obs) for agent, obs in obs_by]
+    results = _act_round(obs_by, concurrency)
 
     actions = {}
     for (agent, _obs), action in zip(obs_by, results):
+        # Enforce the leak invariant at the env boundary for EVERY worker (not just
+        # LLMWorker): a custom worker_factory worker could emit raw, leaky args that
+        # would otherwise land in the trace's ActionRecords. Idempotent for already-
+        # sanitized LLMWorker actions (§3.2).
+        action = sanitize_action_args(action)
         actions[agent.agent_id] = action
         telemetry.log_event(
             "worker_turn",
@@ -123,10 +214,14 @@ def _round_actions(
     if bus is not None:
         for agent, _obs in obs_by:
             for msg in getattr(agent, "pending_messages", []) or []:
-                bus.post(msg)
-                if bus_messages is not None:
-                    bus_messages.append(msg)
-                telemetry.log_event("message", msg.model_dump(by_alias=True))
+                # Sanitize at the bus boundary regardless of source: a custom
+                # worker's raw pending_messages must not leak (recipient/content)
+                # into the trace or, via team-addressing, into observations (§3.2).
+                safe = _sanitize_bus_message(msg)
+                if safe is None:
+                    continue
+                bus.post(safe)
+                telemetry.log_event("message", safe.model_dump(by_alias=True))
 
     return actions
 
@@ -146,8 +241,7 @@ def run_episode(
     """Run one full episode end-to-end; emit EpisodeTrace + EpisodeMetrics (§8)."""
     env.reset()
     obs_snapshots: list[dict] = []
-    bus_messages: list[Message] = []
-    concurrency = getattr(settings.run, "worker_concurrency", 1)
+    concurrency = _effective_concurrency(settings, len(agents))
 
     while not env.done:
         actions = _round_actions(
@@ -157,10 +251,17 @@ def run_episode(
             telemetry,
             concurrency,
             bus=bus,
-            bus_messages=bus_messages,
         )
         env_step(env, actions)
+        if bus is not None:
+            # Drain the env's report/request_help messages onto the bus right away
+            # so the bus is the single authoritative delivery path (§5.2).
+            _drain_env_messages(env, bus, telemetry)
 
+    # With a bus, its verbatim log is the single source of trace messages (worker
+    # drafts + drained env messages) — no duplicates. Offline (no bus) the env's
+    # own record stands. ``env.all_messages`` is preserved for compatibility.
+    trace_messages = list(bus.log) if bus is not None else list(env.all_messages)
     trace = EpisodeTrace(
         episode_idx=episode_idx,
         seed=env.seed,
@@ -172,7 +273,7 @@ def run_episode(
         },
         behavior_cards=list(orca_config.behavior_cards.values()),
         action_records=list(env.all_records),
-        messages=list(env.all_messages) + bus_messages,
+        messages=trace_messages,
         milestone_timeline=list(env.milestone_timeline),
         frontier_reached=env.frontier,
         terminated_reason=env.terminated_reason,
@@ -209,11 +310,32 @@ def _episode_digest(trace: EpisodeTrace, metrics: EpisodeMetrics) -> str:
     return "\n".join(lines)
 
 
-def _learning_signal_for(metrics: EpisodeMetrics, agent_id: str) -> float:
-    for st in metrics.agent_stats:
-        if st.agent_id == agent_id:
-            return st.learning_signal
-    return 0.0
+def _should_write_memory(accepted: bool, proposal) -> bool:
+    """Whether an episode-end memory write should run (§4.5/§6.5).
+
+    Memory is written ONLY when a NON-EMPTY coach proposal was accepted after a
+    real gate eval. An empty proposal (no card edits) is only *trivially* accepted
+    by the gate — it short-circuits and skips the non-regression batch — so its
+    scores must NOT drive an ungated memory write (which could persist a negative
+    weaken/remove with the safety check bypassed). ``None`` (Phase 0, no coach) and
+    rejected proposals also write nothing."""
+    return bool(accepted) and proposal is not None and not proposal.is_empty()
+
+
+def _coach_signals(proposal) -> dict[str, float]:
+    """Per-agent ``learning_signal`` from an ACCEPTED coach proposal (§6.4/§4.5).
+
+    These are the dials the verbal coach set (``proposal.scores[aid]
+    ["learning_signal"]``), NOT the stale objective default on
+    ``metrics.agent_stats`` — so a negative coach signal can actually reach the
+    memory write and weaken/remove a heuristic."""
+    out: dict[str, float] = {}
+    for aid, sc in (getattr(proposal, "scores", None) or {}).items():
+        try:
+            out[aid] = float(sc.get("learning_signal", 0.0))
+        except (TypeError, ValueError, AttributeError):
+            out[aid] = 0.0
+    return out
 
 
 def _update_execution_memories(
@@ -221,8 +343,14 @@ def _update_execution_memories(
     memories: dict[str, ExecutionMemory],
     trace: EpisodeTrace,
     metrics: EpisodeMetrics,
+    learning_signals: dict[str, float],
 ) -> None:
-    """Persist agent-owned memory writes after an accepted update (§4.5, §6.5)."""
+    """Persist agent-owned memory writes after an accepted update (§4.5, §6.5).
+
+    Each agent's edit magnitude is driven by the accepted coach proposal's
+    ``learning_signal`` (``learning_signals``); agents the coach did not score get
+    ``0.0`` (a no-op — no LLM call, no change). ``> 0`` adds/strengthens, ``~0``
+    leaves memory alone, ``< 0`` weakens/removes the flagged rule."""
     if not memories:
         return
     digest = _episode_digest(trace, metrics)
@@ -230,7 +358,7 @@ def _update_execution_memories(
         update = getattr(agent, "end_episode_update", None)
         if update is None:
             continue
-        ls = _learning_signal_for(metrics, agent.agent_id)
+        ls = float(learning_signals.get(agent.agent_id, 0.0))
         update(digest, ls)
         memory = getattr(agent, "memory", None)
         if isinstance(memory, ExecutionMemory):
@@ -269,8 +397,9 @@ def build_agents(
                 behavior_cards.get(aid),
                 memories.get(aid, ExecutionMemory(agent_id=aid)),
                 logger=logger,
+                role=role,  # preserve the roster role when no card is supplied (§4.1)
             )
-            for aid, _role in roster
+            for aid, role in roster
         ]
     return [ShallowOracle(aid) for aid, _role in roster]
 
@@ -461,6 +590,7 @@ def run(
         orca.observe_outcome(config, metrics)  # bandit update (no-op for NoOpOrca)
 
         memory_update_accepted = True
+        proposal = None
         if real and orca.enable_coach:
             if gate is None:  # bar to beat = what bandit-only achieved in Phase 0
                 prior = [m.team_reward for _s, _c, m in history]
@@ -483,8 +613,14 @@ def run(
             )
             memory_update_accepted = decision.accepted
 
-        if memory_update_accepted:
-            _update_execution_memories(episode_agents, memories, trace, metrics)
+        # Memory writes are driven ONLY by an accepted, NON-EMPTY coach proposal's
+        # learning_signal (§4.5/§6.5): no coach (Phase 0), a rejected proposal, or
+        # an empty (gate-bypassing) proposal means no write. The signal sign decides
+        # add/strengthen vs weaken/remove.
+        if _should_write_memory(memory_update_accepted, proposal):
+            _update_execution_memories(
+                episode_agents, memories, trace, metrics, _coach_signals(proposal)
+            )
 
         telemetry.log_episode(trace, metrics)
         history.append((seed, config, metrics))

@@ -10,6 +10,9 @@ run:
   stop_at_milestone: "iron"  # Phase 0 shallow target; null => run to t_max
   message_window: 8       # §5.2 recent_messages K
   single_agent_oracle: true  # Phase 0 placeholder agent (scripted shallow oracle)
+  worker_concurrency: 0   # 0 = AUTO: full team runs one worker call per agent
+                          # concurrently (asyncio); single-agent oracle stays
+                          # sequential. Set a positive int to pin it.
 
 agents:
   temperature: 0.2        # §15 worker temperature (LLM workers, Stream 2)

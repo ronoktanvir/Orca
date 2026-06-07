@@ -24,6 +24,10 @@ from env.seeds import make_world
 # Patterns that constitute a leak.
 _REGION_ID = re.compile(r"\br_\d+\b")
 _FLOAT_PAIR = re.compile(r"-?\d+\.\d+\s*[,;]\s*-?\d+\.\d+")
+# Bare integer coordinate-like pairs, e.g. "12, 3" / "12;3" — kept in sync with
+# ``agents.memory.looks_seed_specific`` so the hard scanner has no blind spot for
+# integer coordinates (legitimate ids like "agent_2" / lone counts are untouched).
+_INT_PAIR = re.compile(r"-?\d+\s*[,;]\s*-?\d+")
 
 
 def _is_number(x: Any) -> bool:
@@ -61,6 +65,8 @@ def scan_for_leaks(obj: Any, path: str = "obs") -> list[str]:
             leaks.append(f"{path}: internal region id in string {obj!r}")
         if _FLOAT_PAIR.search(obj):
             leaks.append(f"{path}: float pair in string {obj!r}")
+        elif _INT_PAIR.search(obj):  # elif: a float pair already covers its int spans
+            leaks.append(f"{path}: integer pair in string {obj!r}")
     return leaks
 
 
@@ -121,6 +127,15 @@ def test_scanner_catches_a_planted_leak():
     assert any("pos" in s for s in leaks)
     assert any("region id" in s for s in leaks)
     assert any("coordinates" in s or "float pair" in s for s in leaks)
+
+
+def test_scanner_catches_bare_integer_coordinate_pair():
+    # The hard scanner must catch integer coordinate strings ("12, 3"), in sync
+    # with agents.memory.looks_seed_specific — no blind spot for integer coords.
+    assert any("integer pair" in s for s in scan_for_leaks({"content": "iron at 12, 3"}))
+    assert any("integer pair" in s for s in scan_for_leaks({"note": "go to -4;7"}))
+    # ...but legitimate agent ids and lone counts are NOT flagged.
+    assert scan_for_leaks({"a": "agent_2", "b": "gather 6 logs", "c": "head N"}) == []
 
 
 __all__ = ["scan_for_leaks", "assert_no_coord_leak"]

@@ -126,6 +126,19 @@ class StubEnv:
         ]
         return relevant[-self.message_window :]
 
+    def drain_posted(self) -> list[Message]:
+        """Hand this round's freshly posted messages to an external bus and clear
+        the internal queue (§5.2).
+
+        The full-team loop runs a single authoritative :class:`~bus.CommBus`; when
+        it owns delivery, it drains the env's messages each round so the env never
+        *also* delivers them (which would double-deliver and add a round of delay).
+        The offline single-agent path never calls this, so its inline delivery is
+        unchanged. ``all_messages`` keeps the verbatim record either way."""
+        posted = self._posted
+        self._posted = []
+        return posted
+
     # ------------------------------------------------------------------ #
     @property
     def done(self) -> bool:
