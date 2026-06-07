@@ -14,6 +14,16 @@ run:
 agents:
   temperature: 0.2        # §15 worker temperature (LLM workers, Stream 2)
 
+llm:                      # swappable model config (§11); keys come from .env
+  provider: "openai"      # openai | wandb_inference
+  worker_model: "gpt-5-mini"   # 4 workers — cheap/fast, high call volume
+  orca_model: "gpt-5"          # Orca — strong reasoning, 1 call/episode
+  temperature: 0.2
+  openai_base_url: null
+  # W&B Inference (GLM-5.1) — alternate provider / ablation, billed to W&B credits
+  wandb_inference_base_url: "https://api.inference.wandb.ai/v1"
+  wandb_inference_model: "zai-org/GLM-4.6"  # set to the GLM-5.1 id when confirmed
+
 reward:
   weights:                # §7.2 / §15 — kept << a frontier step
     deaths: 0.02

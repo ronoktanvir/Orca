@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-from .client import LLMClient, StubLLM
+from .client import LLMClient, OpenAIClient, StubLLM, build_llm
 
-__all__ = ["LLMClient", "StubLLM"]
+__all__ = ["LLMClient", "StubLLM", "OpenAIClient", "build_llm"]

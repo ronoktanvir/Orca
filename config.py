@@ -57,6 +57,19 @@ class AgentsConfig(BaseModel):
     temperature: float = 0.2  # §15 worker determinism (LLM workers, Stream 2)
 
 
+class LLMConfig(BaseModel):
+    """Swappable model config (§11). provider: openai | wandb_inference."""
+
+    provider: str = "openai"
+    worker_model: str = "gpt-5-mini"  # 4 workers: cheap/fast, high call volume
+    orca_model: str = "gpt-5"  # Orca: strong reasoning, 1 call/episode
+    temperature: float = 0.2  # §15
+    openai_base_url: Optional[str] = None  # None => api.openai.com
+    # W&B Inference (GLM-5.1) — billed to W&B credits; an alternate/ablation provider.
+    wandb_inference_base_url: str = "https://api.inference.wandb.ai/v1"
+    wandb_inference_model: str = "zai-org/GLM-4.6"  # set to the GLM-5.1 id when confirmed
+
+
 class RewardConfig(BaseModel):
     weights: dict[str, float] = Field(
         default_factory=lambda: {"deaths": 0.02, "invalid": 0.05, "idle": 0.05}
@@ -87,6 +100,7 @@ class TelemetryConfig(BaseModel):
 class OrcaSettings(BaseModel):
     run: RunConfig = Field(default_factory=RunConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
     reward: RewardConfig = Field(default_factory=RewardConfig)
     bandit: BanditConfig = Field(default_factory=BanditConfig)
     phases: PhasesConfig = Field(default_factory=PhasesConfig)
