@@ -1,31 +1,44 @@
-"""The run loop (F5 / §8).
+"""The run loop (F5 / §8) — Stream 3 owns the Orca integration.
 
-The thin, faithful version of the §8 training loop with a no-op Orca:
+The faithful §8 training loop, with the real Architecture-C2 manager wired in:
 
-    config  = orca.choose_config(history)     # frozen cards (Phase 0)
-    trace   = run_episode(seed, config)        # workers act over rounds, env enforces validity
-    metrics = reward_computer(trace)           # §7 team frontier + stats
-    orca.observe_outcome(config, metrics)      # bandit update (no-op in Phase 0)
-    proposal = orca.coach(trace, metrics)      # coaching (no-op in Phase 0)
-    if accept_gate(proposal): orca.commit(proposal)
+    config   = orca.choose_config(history)     # bandit picks delegation arms (§6.3)
+    trace    = run_episode(seed, config)        # workers act; env enforces validity
+    metrics  = reward_computer(trace)           # §7 objective team frontier + stats
+    metrics  = orca.objective_scores(metrics)   # advisory dials, never the reward (§7.3)
+    orca.observe_outcome(config, metrics)       # bandit update, once/episode (§6.3)
+    if phase >= 1:                              # phasing gates Orca's authority (§6.6)
+        proposal = orca.coach(trace, metrics)   # verbal credit assignment (§6.4)
+        gate.evaluate(orca, proposal, eval_fn)  # accept iff non-regressing (§6.5)
     telemetry.log_episode(...)
 
-Everything load-bearing is a ``@op`` so the Weave trace tree nests (§10).
+The offline fallback is preserved (Green-main law): with ``single_agent_oracle``
+(the default) the loop uses the scripted oracle + :class:`NoOpOrca`, so ``python
+run.py`` and ``pytest`` run with no LLM and no network. The full team path uses
+the real :class:`Orca` and the same scripted oracle as a stand-in until Stream 2's
+``LLMWorker`` is swapped in via ``worker_factory``.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from statistics import median
+from typing import Callable, Optional
 
 from agents.scripted import ShallowOracle
 from config import OrcaSettings, load_config
-from contracts import EpisodeMetrics, EpisodeTrace, MilestoneEvent
+from contracts import EpisodeMetrics, EpisodeTrace
 from contracts.enums import Milestone, Role
 from env import StubEnv
-from orca import DEFAULT_ROSTER, NoOpOrca, accept_gate
+from orca import DEFAULT_ROSTER, AcceptGate, NoOpOrca, Orca
 from orca.orca import OrcaConfig
 from reward import reward_computer
 from telemetry import Telemetry, init_telemetry, op
+from train.phases import Phase, current_phase
+
+# Train-pool episodes the accept-gate re-runs to score a proposal (§6.5). Small so
+# coaching stays cheap; held-out seeds are NEVER used here (anti-leakage, §9).
+GATE_BATCH = 2
+GATE_EPSILON = 0.02
 
 
 @op
@@ -49,6 +62,7 @@ def run_episode(
     episode_idx: int,
     telemetry: Telemetry,
     settings: OrcaSettings,
+    baseline_steps: Optional[int] = None,
 ) -> tuple[EpisodeTrace, EpisodeMetrics]:
     """Run one full episode end-to-end; emit EpisodeTrace + EpisodeMetrics (§8)."""
     env.reset()
@@ -94,6 +108,7 @@ def run_episode(
         trace,
         agent_roles=orca_config.roles(),
         weights=settings.reward.weights,
+        baseline_steps=baseline_steps,
     )
     return trace, metrics
 
@@ -104,55 +119,209 @@ def _parse_milestone(value: Optional[str]) -> Optional[Milestone]:
     return Milestone(value)
 
 
+# --------------------------------------------------------------------------- #
+# Building blocks shared by the loop and the eval harness (O7).
+# --------------------------------------------------------------------------- #
+def build_agents(
+    roster: list[tuple[str, Role]],
+    *,
+    llm=None,
+    worker_factory: Optional[Callable] = None,
+) -> list:
+    """Construct the worker objects for a roster.
+
+    Default: the scripted :class:`ShallowOracle` (offline, role-independent).
+    ``worker_factory(agent_id, role, llm)`` is the Stream 2 seam to swap in the
+    real ``LLMWorker`` without the loop changing.
+    """
+    if worker_factory is not None:
+        return [worker_factory(aid, role, llm) for aid, role in roster]
+    return [ShallowOracle(aid) for aid, _role in roster]
+
+
+def make_env(
+    seed: str, config: OrcaConfig, settings: OrcaSettings, stop_at: Optional[Milestone]
+) -> StubEnv:
+    return StubEnv(
+        seed=seed,
+        episode_idx=0,
+        agents=config.roster,
+        t_max=settings.run.t_max,
+        day_length=settings.run.day_length,
+        message_window=settings.run.message_window,
+        stop_at_milestone=stop_at,
+        behavior_cards=config.behavior_cards,
+    )
+
+
+def play_episode(
+    orca,
+    seed: str,
+    settings: OrcaSettings,
+    *,
+    episode_idx: int,
+    telemetry: Telemetry,
+    stop_at: Optional[Milestone] = None,
+    llm=None,
+    worker_factory: Optional[Callable] = None,
+    greedy: bool = False,
+    baseline_steps: Optional[int] = None,
+) -> tuple[OrcaConfig, EpisodeTrace, EpisodeMetrics]:
+    """Choose a config, run one episode, and fill the advisory dials (§7.3).
+
+    ``greedy`` (Orca only) selects the best learned arms with no exploration — for
+    held-out eval and gate batches. Works for both ``Orca`` and ``NoOpOrca``.
+    """
+    try:
+        config = orca.choose_config(None, greedy=greedy)
+    except TypeError:
+        config = orca.choose_config(None)
+    agents = build_agents(config.roster, llm=llm, worker_factory=worker_factory)
+    env = make_env(seed, config, settings, stop_at)
+    trace, metrics = run_episode(
+        env,
+        agents,
+        config,
+        episode_idx=episode_idx,
+        telemetry=telemetry,
+        settings=settings,
+        baseline_steps=baseline_steps,
+    )
+    if isinstance(orca, Orca):
+        metrics = orca.objective_scores(metrics)
+    return config, trace, metrics
+
+
+def _gate_eval_batch(
+    orca: Orca,
+    settings: OrcaSettings,
+    seeds: list[str],
+    *,
+    stop_at: Optional[Milestone],
+    telemetry: Telemetry,
+    llm=None,
+    worker_factory: Optional[Callable] = None,
+) -> list[EpisodeMetrics]:
+    """Re-run a small train-pool batch with greedy arms (no bandit update) (§6.5)."""
+    out: list[EpisodeMetrics] = []
+    for s in seeds:
+        _cfg, _trace, metrics = play_episode(
+            orca,
+            s,
+            settings,
+            episode_idx=0,
+            telemetry=telemetry,
+            stop_at=stop_at,
+            llm=llm,
+            worker_factory=worker_factory,
+            greedy=True,
+        )
+        out.append(metrics)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 def run(
     settings: Optional[OrcaSettings] = None,
     *,
     config_path: Optional[str] = None,
     telemetry: Optional[Telemetry] = None,
+    orca=None,
+    llm=None,
+    worker_factory: Optional[Callable] = None,
 ) -> list[tuple[EpisodeTrace, EpisodeMetrics]]:
-    """Drive ``n_episodes`` episodes; return their (trace, metrics) pairs (§8)."""
+    """Drive ``n_episodes`` episodes; return their (trace, metrics) pairs (§8).
+
+    Default (``single_agent_oracle``): the offline smoke — scripted oracle +
+    :class:`NoOpOrca`. Full team: the real :class:`Orca` with bandit + (phased)
+    coach + accept-gate and rotated train seeds.
+    """
     settings = settings or load_config(config_path)
     telemetry = telemetry or init_telemetry(
         mode=settings.telemetry.mode,
+        entity=settings.telemetry.entity,
         project=settings.telemetry.project,
         run_dir=settings.telemetry.run_dir,
     )
+    stop_at = _parse_milestone(settings.run.stop_at_milestone)
 
     if settings.run.single_agent_oracle:
         roster: list[tuple[str, Role]] = [("agent_1", Role.MINER)]
+        orca = orca or NoOpOrca(roster)
     else:
         roster = list(DEFAULT_ROSTER)
-    # Phase 0 placeholder: the scripted oracle stands in for every worker.
-    agents = [ShallowOracle(aid) for aid, _role in roster]
+        orca = orca or Orca(
+            roster,
+            llm=llm,
+            epsilon=settings.bandit.epsilon,
+            seed=0,
+            telemetry=telemetry,
+        )
+    real = isinstance(orca, Orca)
 
-    orca = NoOpOrca(roster)
-    stop_at = _parse_milestone(settings.run.stop_at_milestone)
     train_seeds = settings.seeds.train or [settings.run.seed]
+    gate_seeds = train_seeds[:GATE_BATCH]
+    phase0_length = settings.phases.phase0_length
+
+    first_win_seen = False
+    win_rounds: list[int] = []
+    baseline_steps: Optional[int] = None
+    gate: Optional[AcceptGate] = None
 
     history: list = []
     results: list[tuple[EpisodeTrace, EpisodeMetrics]] = []
 
     for ep in range(settings.run.n_episodes):
-        seed = settings.run.seed if settings.run.n_episodes == 1 else train_seeds[ep % len(train_seeds)]
-        config = op(orca.choose_config)(history)
-        env = StubEnv(
-            seed=seed,
-            episode_idx=ep,
-            agents=config.roster,
-            t_max=settings.run.t_max,
-            day_length=settings.run.day_length,
-            message_window=settings.run.message_window,
-            stop_at_milestone=stop_at,
-            behavior_cards=config.behavior_cards,
+        seed = (
+            settings.run.seed
+            if settings.run.n_episodes == 1
+            else train_seeds[ep % len(train_seeds)]
         )
-        trace, metrics = run_episode(
-            env, agents, config, episode_idx=ep, telemetry=telemetry, settings=settings
+        phase = current_phase(ep, phase0_length, first_win_seen)
+        if real:
+            orca.enable_coach = phase >= Phase.PHASE_1
+
+        config, trace, metrics = play_episode(
+            orca,
+            seed,
+            settings,
+            episode_idx=ep,
+            telemetry=telemetry,
+            stop_at=stop_at,
+            llm=llm,
+            worker_factory=worker_factory,
+            baseline_steps=baseline_steps if phase >= Phase.PHASE_2 else None,
         )
 
-        orca.observe_outcome(config, metrics)  # bandit update (no-op)
-        proposal = op(orca.coach)(trace, metrics)  # coaching (no-op)
-        if op(accept_gate)(proposal):  # gate (no-op keep)
-            orca.commit(proposal)
+        # Phase 2 (§6.6/§7.4): activate the speed-reward baseline only after a win.
+        if metrics.won:
+            win_rounds.append(metrics.n_rounds)
+            if not first_win_seen:
+                first_win_seen = True
+                baseline_steps = int(median(win_rounds))
+
+        orca.observe_outcome(config, metrics)  # bandit update (no-op for NoOpOrca)
+
+        if real and orca.enable_coach:
+            if gate is None:  # bar to beat = what bandit-only achieved in Phase 0
+                prior = [m.team_reward for _s, _c, m in history]
+                base = sum(prior) / len(prior) if prior else 0.0
+                gate = AcceptGate(epsilon=GATE_EPSILON, baseline=base)
+            proposal = op(orca.coach)(trace, metrics)
+            gate.evaluate(
+                orca,
+                proposal,
+                lambda: _gate_eval_batch(
+                    orca,
+                    settings,
+                    gate_seeds,
+                    stop_at=stop_at,
+                    telemetry=telemetry,
+                    llm=llm,
+                    worker_factory=worker_factory,
+                ),
+                telemetry=telemetry,
+            )
 
         telemetry.log_episode(trace, metrics)
         history.append((seed, config, metrics))
@@ -161,4 +330,12 @@ def run(
     return results
 
 
-__all__ = ["run", "run_episode", "worker_turn", "env_step"]
+__all__ = [
+    "run",
+    "run_episode",
+    "play_episode",
+    "build_agents",
+    "make_env",
+    "worker_turn",
+    "env_step",
+]

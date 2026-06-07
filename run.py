@@ -33,6 +33,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["auto", "weave", "local", "off"],
         help="override telemetry.mode",
     )
+    p.add_argument(
+        "--full-team",
+        action="store_true",
+        help="use the real 4-agent Orca (bandit + phased coach + accept-gate) "
+        "instead of the single-agent no-op smoke",
+    )
     return p.parse_args(argv)
 
 
@@ -46,6 +52,8 @@ def main(argv: list[str] | None = None) -> int:
         settings.run.n_episodes = args.episodes
     if args.telemetry is not None:
         settings.telemetry.mode = args.telemetry
+    if args.full_team:
+        settings.run.single_agent_oracle = False  # real Orca over the 4-agent roster
 
     telemetry = init_telemetry(
         mode=settings.telemetry.mode,

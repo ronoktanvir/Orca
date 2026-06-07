@@ -94,7 +94,7 @@ def main() -> int:
         _check("Folder ownership + config structure agreed", gate_folder_ownership),
     ]
     all_green = all(results)
-    print("\n" + ("FORK GATE: GREEN ✅ — ready to hand off the stubs." if all_green
+    print("\n" + ("FORK GATE: GREEN ✅ — Phase 0 foundation invariants intact." if all_green
                   else "FORK GATE: RED ❌ — see failures above."))
     return 0 if all_green else 1
 

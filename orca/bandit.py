@@ -24,18 +24,28 @@ class _ArmStats:
 
 @dataclass
 class EpsilonGreedyBandit:
-    """Per-situation ε-greedy bandit over a small discrete arm menu (§6.3)."""
+    """Per-situation ε-greedy bandit over a small discrete arm menu (§6.3).
+
+    ``optimistic`` sets the initial value of every arm (Sutton & Barto optimistic
+    initialisation): with it ≥ the max achievable frontier, untried arms always
+    look best, so the bandit tries each arm before it starts exploiting — which
+    is what makes "Orca finds the best delegation" reliable within dozens of
+    episodes rather than luck-of-the-ε-draw. The first real update overwrites the
+    optimistic seed (count 0→1), so it never biases the converged value.
+    """
 
     arms: dict[str, list[str]]  # situation -> list of arm names
     epsilon: float = 0.2
     seed: int = 0
+    optimistic: float = 0.0
     _stats: dict[str, dict[str, _ArmStats]] = field(default_factory=dict)
     _rng: random.Random = field(default_factory=lambda: random.Random(0))
 
     def __post_init__(self) -> None:
         self._rng = random.Random(self.seed)
         self._stats = {
-            sit: {arm: _ArmStats() for arm in arm_list} for sit, arm_list in self.arms.items()
+            sit: {arm: _ArmStats(mean=self.optimistic) for arm in arm_list}
+            for sit, arm_list in self.arms.items()
         }
 
     def choose(self, situation: str) -> str:
@@ -43,8 +53,15 @@ class EpsilonGreedyBandit:
         arm_list = self.arms[situation]
         if self._rng.random() < self.epsilon:
             return self._rng.choice(arm_list)
+        return self.greedy(situation)
+
+    def greedy(self, situation: str) -> str:
+        """The current best-value arm (pure argmax, no exploration/RNG).
+
+        Used for held-out eval and gate batches, where we want to measure the
+        learned policy, not perturb it (§6.5, §9)."""
         stats = self._stats[situation]
-        return max(arm_list, key=lambda a: stats[a].mean)
+        return max(self.arms[situation], key=lambda a: stats[a].mean)
 
     def update(self, situation: str, arm: str, frontier: float) -> None:
         """Update an arm's value with one episode's team frontier (§6.3)."""

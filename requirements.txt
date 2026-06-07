@@ -5,6 +5,7 @@ pyyaml>=6.0
 numpy>=1.26
 pytest>=8.0
 openai>=1.40        # shared LLM client (llm/client.py); OpenAI + W&B Inference
+matplotlib>=3.8     # eval plots (eval/plots.py); imported lazily so run.py/pytest run without it
 
 # Optional telemetry — the codebase runs and all tests pass without these
 # (telemetry/weave_ops.py falls back to a local-JSONL / no-op logger).
