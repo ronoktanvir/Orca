@@ -225,12 +225,17 @@ def train_full_c2(
     llm=None,
     phase0_length: Optional[int] = None,
     gate_epsilon: float = 0.02,
+    gate_batch: int = 2,
     bandit_seed: int = 0,
 ) -> TrainResult:
-    """Train an Orca under ``spec`` on ``train_seeds`` (bandit + phased coach + gate)."""
+    """Train an Orca under ``spec`` on ``train_seeds`` (bandit + phased coach + gate).
+
+    ``gate_batch`` is the number of train-pool episodes the accept-gate re-runs per
+    coached episode — the dominant Phase-1 cost lever (see ``eval/cost_model.py``).
+    """
     phase0_length = settings.phases.phase0_length if phase0_length is None else phase0_length
     orca = make_orca(spec, settings, llm=llm, seed=bandit_seed)
-    gate_seeds = train_seeds[:2]
+    gate_seeds = train_seeds[:max(1, gate_batch)]
     gate: Optional[AcceptGate] = None
     first_win = False
     history_reward: list[float] = []

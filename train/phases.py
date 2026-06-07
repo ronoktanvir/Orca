@@ -19,7 +19,13 @@ class Phase(IntEnum):
 
 
 def current_phase(episode_idx: int, phase0_length: int, first_win_seen: bool) -> Phase:
-    """Phase from progress. Phase 0 always reports PHASE_0 (foundation)."""
+    """Phase from progress (§6.6).
+
+    A first win flips straight to PHASE_2 (activate the speed reward, §7.4) even
+    during warmup — a win is the stronger signal. Otherwise the first
+    ``phase0_length`` episodes are warmup (PHASE_0, cards frozen, bandit only), and
+    after that PHASE_1 (coaching, accept-gated). Note: an early win therefore
+    enables coaching before ``phase0_length`` (rare; relevant to cost estimates)."""
     if first_win_seen:
         return Phase.PHASE_2
     if episode_idx >= phase0_length:
