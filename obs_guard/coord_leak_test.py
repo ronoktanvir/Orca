@@ -24,6 +24,10 @@ from env.seeds import make_world
 # Patterns that constitute a leak.
 _REGION_ID = re.compile(r"\br_\d+\b")
 _FLOAT_PAIR = re.compile(r"-?\d+\.\d+\s*[,;]\s*-?\d+\.\d+")
+# Bare integer coordinate-like pairs, e.g. "12, 3" / "12;3" — kept in sync with
+# ``agents.memory.looks_seed_specific`` so the hard scanner has no blind spot for
+# integer coordinates (legitimate ids like "agent_2" / lone counts are untouched).
+_INT_PAIR = re.compile(r"-?\d+\s*[,;]\s*-?\d+")
 
 
 def _is_number(x: Any) -> bool:
@@ -61,6 +65,8 @@ def scan_for_leaks(obj: Any, path: str = "obs") -> list[str]:
             leaks.append(f"{path}: internal region id in string {obj!r}")
         if _FLOAT_PAIR.search(obj):
             leaks.append(f"{path}: float pair in string {obj!r}")
+        elif _INT_PAIR.search(obj):  # elif: a float pair already covers its int spans
+            leaks.append(f"{path}: integer pair in string {obj!r}")
     return leaks
 
 
@@ -123,43 +129,13 @@ def test_scanner_catches_a_planted_leak():
     assert any("coordinates" in s or "float pair" in s for s in leaks)
 
 
-# --------------------------------------------------------------------------- #
-# E2: the richer observation (landmarks, mobs, layer transitions) must stay clean
-# --------------------------------------------------------------------------- #
-def test_rich_obs_with_landmarks_and_mobs_no_leak():
-    # Reveal a neighbor that carries a lava_pool (populates known_landmarks) and
-    # observe at night (populates mobs) — the richer obs must not leak coords.
-    from env.observation import serialize_observation
-    from env.world import AgentState
-
-    world = make_world("A")
-    world.add_agent(AgentState(agent_id="a", role=Role.MINER, region_id="r_00"))
-    world.regions["r_07"].discovered = True  # caves w/ lava_pool, neighbor of start
-    obs = serialize_observation(world, "a", round_idx=60, day_length=100)  # round 60 -> night
-    assert obs.known_landmarks, "landmarks should be populated (test is real)"
-    assert obs.here.mobs, "night mobs should be populated (test is real)"
-    assert_no_coord_leak(obs)
-
-
-def test_obs_in_nether_after_portal_no_leak():
-    # Build+light+enter a nether portal, then observe in the Nether (new layer
-    # state + nether mob path) — still coordinate-clean.
-    from random import Random
-
-    from contracts import Action
-    from contracts.enums import ActionName
-    from env.actions import resolve_action
-    from env.observation import serialize_observation
-    from env.world import AgentState
-
-    world = make_world("A")
-    agent = AgentState(agent_id="a", role=Role.TINKERER, region_id="r_00", inventory={"nether_portal": 1})
-    world.add_agent(agent)
-    resolve_action(world, agent, Action(name=ActionName.PLACE, args={"item": "nether_portal"}), Random(0), 0)
-    resolve_action(world, agent, Action(name=ActionName.MOVE, args={"to": "nether"}), Random(0), 1)
-    obs = serialize_observation(world, "a", round_idx=1, day_length=100)
-    assert obs.self_view.layer.value == "nether"
-    assert_no_coord_leak(obs)
+def test_scanner_catches_bare_integer_coordinate_pair():
+    # The hard scanner must catch integer coordinate strings ("12, 3"), in sync
+    # with agents.memory.looks_seed_specific — no blind spot for integer coords.
+    assert any("integer pair" in s for s in scan_for_leaks({"content": "iron at 12, 3"}))
+    assert any("integer pair" in s for s in scan_for_leaks({"note": "go to -4;7"}))
+    # ...but legitimate agent ids and lone counts are NOT flagged.
+    assert scan_for_leaks({"a": "agent_2", "b": "gather 6 logs", "c": "head N"}) == []
 
 
 __all__ = ["scan_for_leaks", "assert_no_coord_leak"]

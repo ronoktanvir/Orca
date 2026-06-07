@@ -121,12 +121,23 @@ class RealRunner:
         memory: bool = True,
         gate_on: bool = True,
     ) -> tuple[EpisodeTrace, EpisodeMetrics]:
+        from bus import CommBus
         from train.loop import build_agents, make_env, run_episode
 
         agents = build_agents(config.roster, llm=self.llm, worker_factory=self.worker_factory)
         env = make_env(seed, config, self.settings, self.stop_at)
+        # One authoritative comm bus for multi-agent rosters (t+1 delivery, §5.2);
+        # the single-agent path needs none. Mirrors the train loop so the eval path
+        # is not stuck on the env's old inline (t+2) delivery.
+        bus = CommBus(window=self.settings.run.message_window) if len(config.roster) > 1 else None
         trace, metrics = run_episode(
-            env, agents, config, episode_idx=episode_idx, telemetry=self.telemetry, settings=self.settings
+            env,
+            agents,
+            config,
+            episode_idx=episode_idx,
+            telemetry=self.telemetry,
+            settings=self.settings,
+            bus=bus,
         )
         # Fill the advisory dials objectively too, so the real path mirrors the sim.
         return trace, Orca.objective_scores(metrics)

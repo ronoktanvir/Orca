@@ -22,12 +22,15 @@ import json
 import re
 from typing import Any, Callable, Optional
 
+from bus.messages import normalize_recipient
+
 from contracts import Action, BehaviorCard, ExecutionMemory, Heuristic, Message, Observation
 from contracts.enums import ActionName, MessageType, Role
 
 from .memory import (
     NEUTRAL_BAND,
     looks_seed_specific,
+    sanitize_action_args,
     scrub_seed_specific,
     update_execution_memory,
 )
@@ -71,13 +74,17 @@ class LLMWorker:
         memory: Optional[ExecutionMemory] = None,
         history_summary: str = "",
         *,
+        role: Optional[Role] = None,
         logger: Optional[Callable[[str, dict], None]] = None,
         max_messages_per_round: int = 2,
         history_keep: int = 6,
     ) -> None:
         self.agent_id = agent_id
         self.llm = llm
-        self.card = card or BehaviorCard(agent_id=agent_id, role=Role.MINER)
+        # When no card is supplied, keep the roster ``role`` (the advertised seam
+        # must not silently fall back to miner, §4.1). ``role`` is an optional
+        # kwarg so existing positional constructor calls keep working.
+        self.card = card or BehaviorCard(agent_id=agent_id, role=role or Role.MINER)
         self.memory = memory or ExecutionMemory(agent_id=agent_id)
         self.history_summary = history_summary
         self._logger = logger
@@ -89,7 +96,16 @@ class LLMWorker:
         self.last_reasoning: str = ""
         self.parse_failures: int = 0
         self.messages_dropped: int = 0
-        self._history_lines: list[str] = []
+        self._history_lines: list[str] = []  # compact per-round action notes
+        # Bounded running history of *older* message events (those that have
+        # scrolled out of the live recent window). ``_prev_recent`` lets us detect
+        # the scroll-out; ``_folded`` holds (key, note) deduped by key; ``_live_keys``
+        # is the current window so a message that is live again is excluded from the
+        # summary — never both shown live and summarized at once (§4.3/§5.2).
+        self._folded: list[tuple] = []
+        self._folded_keys: set = set()
+        self._prev_recent: list[Message] = []
+        self._live_keys: set = set()
 
     # ------------------------------------------------------------------ #
     @property
@@ -113,6 +129,9 @@ class LLMWorker:
         """One worker turn: obs -> Action (+ stashed messages) (§4.2, §4.4)."""
         self.pending_messages = []
         self.last_reasoning = ""
+        # Fold any messages that scrolled out of the live window into the bounded
+        # running history BEFORE building the prompt (§4.3/§5.2).
+        self._observe_messages(obs)
 
         if self.llm is None:
             self._record_parse_failure(obs, "", "no llm client", "")
@@ -155,82 +174,29 @@ class LLMWorker:
         except Exception as exc:
             return None, str(exc)
 
-    @staticmethod
-    def _is_number(x: Any) -> bool:
-        """A real number (not bool) — matches obs_guard's coordinate-pair test."""
-        return isinstance(x, (int, float)) and not isinstance(x, bool)
-
-    @staticmethod
-    def _scrub_arg_value(value: Any) -> tuple[Any, bool]:
-        """Recursively sanitize an action-arg value so it can never leak (§3.2).
-
-        Returns ``(scrubbed_value, unusable)``. ``unusable`` is True when the
-        value cannot be salvaged without leaking — i.e. a string that was
-        *entirely* a coordinate/seed leak (scrubs to empty) or a 2-element numeric
-        list/tuple (a coordinate pair, per ``obs_guard.scan_for_leaks``); the
-        caller then turns the whole action into ``wait``. Leaky dict KEYS (region
-        ids / "pos" / coordinate-like text) are dropped. Enum-ish values ("N",
-        "iron_ore", "agent_2") and clean scalars (e.g. ``"n": 3``) pass through.
-        """
-        unusable = False
-        if isinstance(value, str):
-            if looks_seed_specific(value):
-                cleaned = scrub_seed_specific(value)
-                if value.strip() and not cleaned:
-                    return cleaned, True  # entirely a leak -> unusable
-                return cleaned, False
-            return value, False
-        if isinstance(value, dict):
-            out: dict = {}
-            for k, v in value.items():
-                # Drop keys that themselves leak (e.g. "r_07", "pos").
-                if isinstance(k, str) and looks_seed_specific(k):
-                    continue
-                nv, u = LLMWorker._scrub_arg_value(v)
-                out[k] = nv
-                unusable = unusable or u
-            return out, unusable
-        if isinstance(value, (list, tuple)):
-            # A 2-element all-numeric list/tuple is a coordinate pair -> unusable.
-            if len(value) == 2 and all(LLMWorker._is_number(x) for x in value):
-                return value, True
-            items = []
-            for v in value:
-                nv, u = LLMWorker._scrub_arg_value(v)
-                items.append(nv)
-                unusable = unusable or u
-            return (tuple(items) if isinstance(value, tuple) else items), unusable
-        return value, False
-
     def _sanitize_action(self, action: Action) -> Action:
         """Scrub coordinate-like/seed-specific content from ALL action args (§3.2).
 
-        Walks every value AND key in ``action.args`` (through nested
-        dict/list/tuple) so nothing ``obs_guard.scan_for_leaks`` would flag — a
-        scrubbed string, a coordinate-shaped numeric pair, or a leaky key — ever
-        reaches an ``ActionRecord``. Leaky keys are dropped; a numeric coordinate
-        pair or an arg that scrubs to empty makes the action fall back to ``wait``.
-        """
-        if not action.args:
-            return action
-        sanitized, unusable = self._scrub_arg_value(action.args)
-        if unusable:
+        Delegates to the shared :func:`agents.memory.sanitize_action_args` (the
+        same enforcement the run loop applies at the env boundary) and adds the
+        worker's telemetry when an unsalvageable arg forces a ``wait`` fallback."""
+        result = sanitize_action_args(action)
+        if result.name == ActionName.WAIT and action.name != ActionName.WAIT:
             self._emit(
                 "invalid_action_args",
                 {"action": action.name.value, "reason": "coordinate-like or seed-specific arg"},
             )
-            return self.safe_default()
-        if sanitized == action.args:
-            return action
-        return Action(name=action.name, args=sanitized)
+        return result
 
     def _sanitize_messages(self, drafts: list, obs: Observation) -> list[Message]:
         """Coerce model drafts into validated ``Message`` objects (§4.4, §5.1).
 
-        Fills ``from`` (this worker), ``round`` (current obs round), defaults
-        ``to`` to ``team``, coerces ``type``, clamps ``urgency``, scrubs
-        coordinate-like content, and drops anything empty after scrubbing.
-        Caps the count at ``max_messages_per_round`` (bandwidth realism, §5.1).
+        Fills ``from`` (this worker), ``round`` (current obs round), **validates
+        the recipient** (``to`` may only be ``team`` / ``orca`` / an ``agent_<n>``
+        id — anything leaky like ``r_07`` is downgraded to ``team``, §3.2), coerces
+        ``type``, clamps ``urgency``, scrubs coordinate-like content, and drops
+        anything empty after scrubbing. Caps the count at
+        ``max_messages_per_round`` (bandwidth realism, §5.1).
         """
         out: list[Message] = []
         for d in drafts:
@@ -247,7 +213,9 @@ class LLMWorker:
                 mtype = MessageType(raw_type)
             except ValueError:
                 mtype = MessageType.REPORT
-            to = (getattr(d, "to", "") or "team").strip() or "team"
+            # The model cannot be trusted with the recipient: validate it so an
+            # internal region id / coordinate-like string never reaches Message.to.
+            to = normalize_recipient(getattr(d, "to", ""))
             try:
                 urgency = max(0.0, min(1.0, float(getattr(d, "urgency", 0.3))))
             except (TypeError, ValueError):
@@ -269,7 +237,7 @@ class LLMWorker:
     def _finish(self, obs: Observation, action: Action) -> Action:
         """Update the bounded running history summary, then return the action."""
         self._history_lines.append(f"r{obs.round}:{action.name.value}")
-        self.history_summary = compact_history(self._history_lines, self.history_keep)
+        self.history_summary = self._compose_history()
         self._emit(
             "worker_decision",
             {
@@ -280,6 +248,59 @@ class LLMWorker:
             },
         )
         return action
+
+    # ------------------------------------------------------------------ #
+    # Bounded running history (actions + older message events) (§4.3/§5.2)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _msg_key(m: Message) -> tuple:
+        mtype = getattr(getattr(m, "type", None), "value", str(getattr(m, "type", "")))
+        return (m.from_agent, m.to, m.round, mtype, m.content)
+
+    @staticmethod
+    def _compact_msg_note(m: Message) -> str:
+        """A compact, leak-free note for a message that has left the live window.
+
+        Carries sender / recipient / type / round — meaningful context for older
+        turns — but not the raw content (which was shown in full while live, and
+        whose omission keeps the summary bounded and out of the leak surface)."""
+        mtype = getattr(getattr(m, "type", None), "value", str(getattr(m, "type", "")))
+        return f"r{m.round} {m.from_agent}->{m.to} [{mtype}]"
+
+    def _observe_messages(self, obs: Observation) -> None:
+        """Fold messages that scrolled out of the live recent window into history.
+
+        The live window (``obs.recent_messages``) is shown in full in the prompt;
+        here we record the *older* messages — those seen previously but no longer
+        live — exactly once (deduped by key). The summary then excludes anything
+        currently live, so recent and summarized message context stay disjoint even
+        if a message re-enters the window (no double-count), bounded + leak-free.
+        """
+        current = list(getattr(obs, "recent_messages", []) or [])
+        self._live_keys = {self._msg_key(m) for m in current}
+        for m in self._prev_recent:
+            k = self._msg_key(m)
+            if k in self._live_keys or k in self._folded_keys:
+                continue
+            self._folded_keys.add(k)
+            self._folded.append((k, self._compact_msg_note(m)))
+        self._prev_recent = current
+        self.history_summary = self._compose_history()
+
+    def _compose_history(self) -> str:
+        """Combine the action history and older-message history into one bounded,
+        leak-free summary string (§4.3)."""
+        parts: list[str] = []
+        if self._history_lines:
+            parts.append("actions: " + compact_history(self._history_lines, self.history_keep))
+        # Only messages NOT currently live (so a re-entered message is never both
+        # shown live in the obs and summarized here).
+        older = [note for k, note in self._folded if k not in self._live_keys]
+        if older:
+            parts.append("messages: " + compact_history(older, self.history_keep))
+        composed = "\n".join(parts)
+        # Defense in depth: never let a coordinate-like span survive into the prompt.
+        return scrub_seed_specific(composed) if looks_seed_specific(composed) else composed
 
     def _record_parse_failure(self, obs: Observation, raw: str, error: str, raw2: str) -> None:
         self.parse_failures += 1
@@ -344,14 +365,21 @@ class LLMWorker:
     ) -> ExecutionMemory:
         """Fold episode-end heuristics into memory, scaled by ``learning_signal`` (§4.5).
 
-        With ``|learning_signal|`` ~ 0 (Phase 0 / no-op Orca) this makes no LLM
-        call and leaves memory unchanged (beyond a guard-filter pass), keeping the
-        offline path cheap. A positive signal proposes + bakes in heuristics; a
-        negative signal weakens/removes flagged rules.
+        The candidate rules depend on the sign of the coach's signal:
+          * ``~0`` (|signal| <= NEUTRAL_BAND): no LLM call, memory unchanged beyond a
+            guard-filter pass (keeps the offline path cheap).
+          * ``> 0``: ask the LLM for NEW transferable how-to to add/strengthen.
+          * ``< 0``: the coach judged this agent's lessons net-harmful — the
+            weaken/remove candidates are its OWN current heuristics. We feed those
+            in directly rather than calling the "propose good how-to" LLM (which
+            would never surface a rule to drop), so a negative signal actually
+            weakens/removes memory instead of relying on a coincidental re-proposal.
         """
         proposed: list[Heuristic] = []
-        if abs(learning_signal) > NEUTRAL_BAND:
+        if learning_signal > NEUTRAL_BAND:
             proposed = self.propose_memory(episode_digest)
+        elif learning_signal < -NEUTRAL_BAND:
+            proposed = list(self.memory.heuristics)
         self.memory = update_execution_memory(self.memory, proposed, learning_signal)
         self._emit(
             "memory_update",

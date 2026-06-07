@@ -9,11 +9,30 @@ default and is covered by tests/test_run_loop.py.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import train.loop as loop
 from agents.worker import LLMWorker
 from config import load_config
+from contracts import ExecutionMemory, Heuristic
+from contracts.enums import Role
 from obs_guard.coord_leak_test import assert_no_coord_leak
+from orca.orca import Proposal
 from telemetry import init_telemetry
+
+
+class AcceptingGate:
+    """A gate stub that always accepts (the eval batch is irrelevant here)."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def evaluate(self, *args, **kwargs):
+        return SimpleNamespace(accepted=True)
+
+
+def _msg_key(m):
+    return (m.from_agent, m.to, m.type.value, m.content, m.round)
 
 # A valid WorkerOutput: a (legal) scout action + a clean team message every turn.
 _WORKER_JSON = (
@@ -21,6 +40,12 @@ _WORKER_JSON = (
     '"action":{"name":"scout"},'
     '"messages":[{"to":"team","type":"share_finding","content":"checking biomes to the N","urgency":0.3}]}'
 )
+
+# An INVALID action every round (gather a resource that isn't here) — the agents
+# rack up repeated invalids, so the deterministic heuristic coach emits a NON-EMPTY
+# proposal (an execution-fix directive). Needed wherever a test must exercise the
+# real accept-gate/memory path (an empty proposal is only trivially accepted).
+_INVALID_JSON = '{"reasoning":"oops","action":{"name":"gather","args":{"resource":"diamond"}}}'
 
 
 class ConstLLM:
@@ -117,9 +142,10 @@ def test_coord_laden_worker_message_scrubbed_in_loop(monkeypatch):
 # A5/§6.5 — execution-memory writes are gated by the accept-gate
 # --------------------------------------------------------------------------- #
 def test_rejected_proposal_does_not_update_memory(monkeypatch):
-    # Even with a nonzero learning_signal, a rejected proposal must NOT mutate memory.
+    # Even with a nonzero coach learning_signal, a rejected proposal must NOT
+    # mutate memory: end_episode_update is never even called.
     monkeypatch.setattr(loop, "build_llm", lambda role, settings: ConstLLM(_WORKER_JSON))
-    monkeypatch.setattr(loop, "_learning_signal_for", lambda metrics, aid: 1.0)  # nonzero
+    monkeypatch.setattr(loop, "_coach_signals", lambda proposal: {f"agent_{i}": 1.0 for i in range(1, 5)})
 
     calls: list = []
 
@@ -146,18 +172,11 @@ def test_rejected_proposal_does_not_update_memory(monkeypatch):
 
 
 def test_accepted_proposal_allows_memory_update(monkeypatch):
-    monkeypatch.setattr(loop, "build_llm", lambda role, settings: ConstLLM(_WORKER_JSON))
+    # Invalid-action workers -> a NON-EMPTY heuristic proposal -> accepted gate ->
+    # the memory write runs for every agent.
+    monkeypatch.setattr(loop, "build_llm", lambda role, settings: ConstLLM(_INVALID_JSON))
 
     calls: list = []
-
-    class AcceptingGate:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def evaluate(self, *args, **kwargs):
-            from types import SimpleNamespace
-
-            return SimpleNamespace(accepted=True)
 
     def spy(self, digest, learning_signal=0.0):
         calls.append(self.agent_id)
@@ -170,3 +189,254 @@ def test_accepted_proposal_allows_memory_update(monkeypatch):
     settings.phases.phase0_length = 0
     loop.run(settings, telemetry=init_telemetry(mode="off"))
     assert calls == ["agent_1", "agent_2", "agent_3", "agent_4"]
+
+
+# --------------------------------------------------------------------------- #
+# Finding 2 — action-level report/request_help share ONE bus path, t+1 delivery.
+# --------------------------------------------------------------------------- #
+_REPORT_JSON = (
+    '{"reasoning":"status",'
+    '"action":{"name":"report","args":{"content":"scouting the N ridge","to":"team","urgency":0.4}},'
+    '"messages":[]}'
+)
+
+
+def test_report_action_delivered_at_t_plus_one_no_dupes(monkeypatch):
+    monkeypatch.setattr(loop, "build_llm", lambda role, settings: ConstLLM(_REPORT_JSON))
+    settings = _settings(t_max=3)
+    (trace, _metrics), = loop.run(settings, telemetry=init_telemetry(mode="off"))
+
+    # Same-round: no message is visible in round 0's observations.
+    round0 = [o for o in trace.observations if o["round"] == 0]
+    assert round0 and all(o["recent_messages"] == [] for o in round0)
+
+    # t+1: a report sent at round 0 is observed by teammates at round 1, carried on
+    # the one authoritative path.
+    round1 = [o for o in trace.observations if o["round"] == 1]
+    assert round1 and any(o["recent_messages"] for o in round1)
+    for o in round1:
+        for rm in o["recent_messages"]:
+            assert rm["type"] == "report"
+
+    # Exactly one report per agent per round reached the trace — none dropped, and
+    # none duplicated (which the old env-inbox + bus double path would have risked).
+    report_msgs = [m for m in trace.messages if m.type.value == "report"]
+    assert len(report_msgs) == len(trace.agent_ids) * trace.n_rounds
+    keys = [_msg_key(m) for m in trace.messages]
+    assert len(keys) == len(set(keys))
+
+
+def test_request_help_action_delivered_at_t_plus_one(monkeypatch):
+    rj = '{"action":{"name":"request_help","args":{"content":"need iron","to":"team","urgency":0.8}}}'
+    monkeypatch.setattr(loop, "build_llm", lambda role, settings: ConstLLM(rj))
+    settings = _settings(t_max=3)
+    (trace, _metrics), = loop.run(settings, telemetry=init_telemetry(mode="off"))
+    assert any(m.type.value == "request_help" for m in trace.messages)
+    # Discriminating: a request_help sent at round 0 is observed at round 1 (t+1),
+    # not round 2 — the old env inbox delivered action messages a round late.
+    round1 = [o for o in trace.observations if o["round"] == 1]
+    assert any(
+        rm["type"] == "request_help" for o in round1 for rm in o["recent_messages"]
+    ), "request_help must reach teammates at t+1, not t+2"
+
+
+def test_custom_worker_factory_cannot_leak_through_actions_or_messages():
+    # The advertised worker_factory seam bypasses LLMWorker's own sanitization, so
+    # the run loop must enforce the leak invariant at the env/bus boundary: a worker
+    # that emits raw leaky action args AND a raw leaky pending message must not leak
+    # into trace.action_records, trace.messages, or observations.
+    from contracts import Action, Message
+    from contracts.enums import ActionName, MessageType
+    from obs_guard import scan_for_leaks
+
+    class _LeakyWorker:
+        def __init__(self, agent_id, role, llm):
+            self.agent_id = agent_id
+            self.pending_messages: list = []
+
+        def act(self, obs):
+            self.pending_messages = [
+                Message(
+                    **{"from": self.agent_id},
+                    to="r_07",  # leaky recipient
+                    type=MessageType.REPORT,
+                    content="iron at 12, 3 near r_07",  # leaky content
+                    urgency=0.5,
+                    round=obs.round,
+                )
+            ]
+            return Action(
+                name=ActionName.REPORT,
+                args={"content": "cache at 12.0, 3.5", "r_07": "x", "to": "r_07"},  # all leaky
+            )
+
+    settings = _settings(t_max=3)
+    (trace, _metrics), = loop.run(
+        settings,
+        telemetry=init_telemetry(mode="off"),
+        worker_factory=lambda aid, role, llm: _LeakyWorker(aid, role, llm),
+    )
+
+    assert trace.messages
+    for m in trace.messages:  # recipient + content scrubbed at the bus boundary
+        assert m.to in ("team", "orca") or m.to.startswith("agent_")
+        assert "r_07" not in m.to and "r_07" not in m.content and "12, 3" not in m.content
+        assert scan_for_leaks(m.model_dump(by_alias=True)) == []
+    for rec in trace.action_records:  # args scrubbed at the env boundary
+        assert "r_07" not in rec.action.args
+        assert scan_for_leaks(rec.model_dump()) == []
+    for i, o in enumerate(trace.observations):
+        assert_no_coord_leak(o, path=f"obs[{i}]")
+
+
+def test_worker_message_recipient_leak_scrubbed_in_loop(monkeypatch):
+    # A worker that puts a region id in the message recipient must not leak it.
+    leaky = (
+        '{"action":{"name":"scout"},'
+        '"messages":[{"to":"r_07","type":"report","content":"caves to the N"}]}'
+    )
+    monkeypatch.setattr(loop, "build_llm", lambda role, settings: ConstLLM(leaky))
+    settings = _settings(t_max=3)
+    (trace, _metrics), = loop.run(settings, telemetry=init_telemetry(mode="off"))
+
+    assert trace.messages
+    for m in trace.messages:
+        assert m.to in ("team", "orca") or m.to.startswith("agent_")
+        assert "r_07" not in m.to
+    for i, o in enumerate(trace.observations):
+        assert_no_coord_leak(o, path=f"obs[{i}]")
+
+
+# --------------------------------------------------------------------------- #
+# Finding 4 — accepted coach proposal's learning_signal drives the memory write.
+# --------------------------------------------------------------------------- #
+def test_accepted_proposal_scores_drive_memory_signal():
+    from tests.fixtures import sample_episode_metrics, sample_episode_trace
+
+    proposal = Proposal(
+        behavior_cards={}, scores={"agent_1": {"learning_signal": 1.0, "performance_score": 0.5}}
+    )
+    calls: list = []
+
+    class SpyAgent:
+        agent_id = "agent_1"
+        memory = ExecutionMemory(agent_id="agent_1")
+
+        def end_episode_update(self, digest, learning_signal=0.0):
+            calls.append(learning_signal)
+            return self.memory
+
+    loop._update_execution_memories(
+        [SpyAgent()],
+        {"agent_1": ExecutionMemory(agent_id="agent_1")},
+        sample_episode_trace(),
+        sample_episode_metrics(),
+        loop._coach_signals(proposal),
+    )
+    assert calls == [1.0]   # the coach's signal, not the objective default
+
+
+def test_no_coach_proposal_means_no_memory_write(monkeypatch):
+    # Phase 0 (coach disabled) builds no proposal -> end_episode_update never runs.
+    monkeypatch.setattr(loop, "build_llm", lambda role, settings: ConstLLM(_WORKER_JSON))
+    calls: list = []
+
+    def spy(self, digest, learning_signal=0.0):
+        calls.append(self.agent_id)
+        return self.memory
+
+    monkeypatch.setattr(LLMWorker, "end_episode_update", spy)
+    settings = _settings(t_max=2)
+    settings.phases.phase0_length = 5  # stay in Phase 0 (no coach) for this single episode
+    loop.run(settings, telemetry=init_telemetry(mode="off"))
+    assert calls == []
+
+
+def test_memory_persists_into_next_episode(monkeypatch):
+    # Invalid-action workers -> a NON-EMPTY accepted proposal -> the (positive)
+    # signal bakes a learned heuristic into memory after episode 0.
+    monkeypatch.setattr(loop, "AcceptGate", AcceptingGate)
+    monkeypatch.setattr(loop, "_coach_signals", lambda proposal: {f"agent_{i}": 1.0 for i in range(1, 5)})
+    learned = Heuristic(condition="when blocked", action="scout before digging", confidence=0.7)
+    monkeypatch.setattr(LLMWorker, "propose_memory", lambda self, digest: [learned])
+
+    settings = _settings(t_max=2)
+    settings.run.n_episodes = 2
+    settings.phases.phase0_length = 0  # coach/gate active from episode 0
+    const = ConstLLM(_INVALID_JSON)
+    monkeypatch.setattr(loop, "build_llm", lambda role, settings: const)
+
+    loop.run(settings, telemetry=init_telemetry(mode="off"))
+
+    # The heuristic written after episode 0 appears in episode 1's worker prompts.
+    assert any("scout before digging" in p for p in const.prompts)
+
+
+# --------------------------------------------------------------------------- #
+# Finding 4 (review follow-up) — an empty (gate-bypassing) proposal must NOT
+# drive a memory write, even with a nonzero score; the negative path is reachable
+# through the loop.
+# --------------------------------------------------------------------------- #
+def test_should_write_memory_rejects_empty_scored_proposal():
+    from orca.cards import make_default_card
+
+    # Empty proposal (no card edits) carrying a nonzero score: the gate only
+    # *trivially* accepts it (no eval batch), so it must NOT authorize a write.
+    empty_scored = Proposal(behavior_cards={}, scores={"agent_1": {"learning_signal": -0.7}})
+    assert empty_scored.is_empty()
+    assert loop._should_write_memory(True, empty_scored) is False     # gate-bypass closed
+    # A real (non-empty) accepted proposal does write; rejected / None never do.
+    nonempty = Proposal(
+        behavior_cards={"agent_1": make_default_card("agent_1", Role.MINER)},
+        scores={"agent_1": {"learning_signal": -0.7}},
+    )
+    assert loop._should_write_memory(True, nonempty) is True
+    assert loop._should_write_memory(False, nonempty) is False
+    assert loop._should_write_memory(True, None) is False
+
+
+def test_empty_proposal_with_scores_does_not_write_through_loop(monkeypatch):
+    # End-to-end: all-scout workers => the heuristic coach yields an EMPTY proposal.
+    # Even though the gate accepts and a nonzero score is present, no write happens.
+    monkeypatch.setattr(loop, "build_llm", lambda role, settings: ConstLLM(_WORKER_JSON))
+    monkeypatch.setattr(loop, "AcceptGate", AcceptingGate)
+    monkeypatch.setattr(loop, "_coach_signals", lambda p: {f"agent_{i}": -0.7 for i in range(1, 5)})
+    calls: list = []
+
+    def spy(self, digest, learning_signal=0.0):
+        calls.append(self.agent_id)
+        return self.memory
+
+    monkeypatch.setattr(LLMWorker, "end_episode_update", spy)
+    settings = _settings(t_max=2)
+    settings.phases.phase0_length = 0
+    loop.run(settings, telemetry=init_telemetry(mode="off"))
+    assert calls == []   # empty proposal -> no memory write despite nonzero scores
+
+
+def test_negative_coach_signal_weakens_memory_through_loop(monkeypatch):
+    # Drive the negative path through the real loop: ep0 adds a rule (positive
+    # signal), ep1 weakens it (negative signal). The weakened confidence shows up
+    # in ep2's worker prompt — proving the negative path is reachable end-to-end.
+    monkeypatch.setattr(loop, "AcceptGate", AcceptingGate)
+    learned = Heuristic(condition="rush ahead", action="skip prep", confidence=0.7)
+    monkeypatch.setattr(LLMWorker, "propose_memory", lambda self, digest: [learned])
+
+    sigs = iter([1.0, -1.0, 0.0])  # ep0 add @0.7, ep1 weaken to 0.2, ep2 observe
+
+    def fake_signals(proposal):
+        s = next(sigs, 0.0)
+        return {f"agent_{i}": s for i in range(1, 5)}
+
+    monkeypatch.setattr(loop, "_coach_signals", fake_signals)
+
+    settings = _settings(t_max=2)
+    settings.run.n_episodes = 3
+    settings.phases.phase0_length = 0
+    const = ConstLLM(_INVALID_JSON)  # non-empty proposals so writes are gated-through
+    monkeypatch.setattr(loop, "build_llm", lambda role, settings: const)
+
+    loop.run(settings, telemetry=init_telemetry(mode="off"))
+
+    # 0.7 - 0.5*|−1.0| = 0.20: the weakened confidence appears in a later prompt.
+    assert any("confidence 0.20" in p for p in const.prompts)

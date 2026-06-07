@@ -141,3 +141,69 @@ def test_run_loop_with_worker_factory_offline():
     assert calls  # the loop built workers via the factory
     for _trace, metrics in results:
         assert metrics.frontier_milestone.value == "iron"
+
+
+# --------------------------------------------------------------------------- #
+# Finding 5 — full-team concurrency: default = one worker call per agent, async,
+# order preserved.
+# --------------------------------------------------------------------------- #
+def test_effective_concurrency_auto_and_explicit():
+    from train.loop import _effective_concurrency
+
+    s = load_config()
+    assert s.run.worker_concurrency == 0           # default is AUTO
+    assert _effective_concurrency(s, n_agents=4) == 4   # full team -> one per agent
+    assert _effective_concurrency(s, n_agents=1) == 1   # single-agent oracle -> sequential
+    s.run.worker_concurrency = 2
+    assert _effective_concurrency(s, n_agents=4) == 2   # explicit override wins
+
+
+def test_act_round_is_concurrent_and_roster_ordered():
+    # Workers whose calls overlap (sleep) and finish out of order must still yield
+    # results assembled in roster order (deterministic action assembly).
+    import time
+
+    from contracts.enums import ActionName
+    from tests.fixtures import sample_observation
+    from train.loop import _act_round
+
+    class _OrderWorker:
+        def __init__(self, idx: int) -> None:
+            self.idx = idx
+            self.agent_id = f"agent_{idx}"
+
+        def act(self, obs):
+            time.sleep((4 - self.idx) * 0.02)  # agent 0 finishes LAST
+            return Action(name=ActionName.WAIT, args={"idx": self.idx})
+
+    obs = sample_observation()
+    obs_by = [(_OrderWorker(i), obs) for i in range(4)]
+
+    t0 = time.perf_counter()
+    results = _act_round(obs_by, concurrency=4)
+    elapsed = time.perf_counter() - t0
+
+    assert [r.args["idx"] for r in results] == [0, 1, 2, 3]  # roster order preserved
+    assert elapsed < 0.02 * (4 + 3 + 2 + 1)  # overlapped, not summed (sequential ~0.20s)
+
+
+# --------------------------------------------------------------------------- #
+# Finding 6 — the no-card seam preserves each roster role.
+# --------------------------------------------------------------------------- #
+def test_build_agents_no_card_preserves_roster_role():
+    from agents.prompts import build_worker_prompt
+    from llm.client import StubLLM
+    from orca import DEFAULT_ROSTER
+    from tests.fixtures import sample_observation
+
+    agents = build_agents(list(DEFAULT_ROSTER), llm=StubLLM())  # no behavior_cards passed
+    got = {a.agent_id: a.role for a in agents}
+    assert got == {
+        "agent_1": Role.EXPLORER,
+        "agent_2": Role.MINER,
+        "agent_3": Role.TINKERER,
+        "agent_4": Role.SUPPORT,
+    }
+    for a in agents:
+        prompt = build_worker_prompt(sample_observation(), a.card, a.memory)
+        assert a.role.value.capitalize() in prompt  # role primer matches the roster role

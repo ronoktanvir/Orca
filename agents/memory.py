@@ -18,17 +18,28 @@ is accept-gated by Stream 3 (§6.5).
 from __future__ import annotations
 
 import re
+from typing import Any
 
-from contracts import ExecutionMemory, Heuristic
+from bus.messages import normalize_recipient
+from contracts import Action, ExecutionMemory, Heuristic
+from contracts.enums import ActionName
 from contracts.execution_memory import MEMORY_CAP
 
 # Patterns that look seed-specific / coordinate-like and must not enter memory.
+# Order matters for ``scrub_seed_specific`` (applied in sequence): the specific
+# float / parenthesized / region / distance spans are removed BEFORE the generic
+# integer-pair pattern, so a float pair like "12.0, 3.5" is excised whole instead
+# of leaving a digit fragment behind.
 _COORD_PATTERNS = [
     re.compile(r"-?\d+\.\d+\s*[,;]\s*-?\d+\.\d+"),  # float pairs e.g. "12.0, 3.5"
     re.compile(r"\(\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\)"),  # (x, y)
     re.compile(r"\br_\d+\b"),  # internal region ids e.g. r_07
     re.compile(r"\bpos\b", re.IGNORECASE),
     re.compile(r"\b\d+\s*(?:blocks?|meters?|tiles?|steps?)\b", re.IGNORECASE),  # distances
+    # Integer coordinate-like pairs e.g. "12, 3" / "12;3". Catches bare integer
+    # pairs the float pattern misses, while leaving legitimate ids like "agent_2"
+    # (no digit,digit sequence) and lone counts (e.g. "6 ingots") untouched.
+    re.compile(r"-?\d+\s*[,;]\s*-?\d+"),
 ]
 
 # Edits below this |learning_signal| are treated as "no change" (§4.5 ~0 dial).
@@ -54,6 +65,79 @@ def scrub_seed_specific(text: str) -> str:
     for p in _COORD_PATTERNS:
         cleaned = p.sub(" ", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+# --------------------------------------------------------------------------- #
+# Action-arg sanitization (§3.2) — shared so the run loop can enforce the leak
+# invariant at the env boundary for ANY worker (not only LLMWorker), covering the
+# advertised ``worker_factory`` seam.
+# --------------------------------------------------------------------------- #
+def _is_coord_number(x: Any) -> bool:
+    """A real number (not bool) — matches obs_guard's coordinate-pair test."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def scrub_arg_value(value: Any) -> tuple[Any, bool]:
+    """Recursively sanitize an action-arg value so it can never leak (§3.2).
+
+    Returns ``(scrubbed_value, unusable)``. ``unusable`` is True when the value
+    cannot be salvaged without leaking — a string that was *entirely* a
+    coordinate/seed leak (scrubs to empty) or a 2-element numeric list/tuple (a
+    coordinate pair). Leaky dict KEYS (region ids / "pos" / coordinate-like text)
+    are dropped. Enum-ish values ("N", "iron_ore", "agent_2") and clean scalars
+    pass through unchanged.
+    """
+    unusable = False
+    if isinstance(value, str):
+        if looks_seed_specific(value):
+            cleaned = scrub_seed_specific(value)
+            if value.strip() and not cleaned:
+                return cleaned, True  # entirely a leak -> unusable
+            return cleaned, False
+        return value, False
+    if isinstance(value, dict):
+        out: dict = {}
+        for k, v in value.items():
+            if isinstance(k, str) and looks_seed_specific(k):
+                continue  # drop keys that themselves leak (e.g. "r_07", "pos")
+            nv, u = scrub_arg_value(v)
+            out[k] = nv
+            unusable = unusable or u
+        return out, unusable
+    if isinstance(value, (list, tuple)):
+        if len(value) == 2 and all(_is_coord_number(x) for x in value):
+            return value, True  # a 2-element all-numeric list/tuple is a coord pair
+        items = []
+        for v in value:
+            nv, u = scrub_arg_value(v)
+            items.append(nv)
+            unusable = unusable or u
+        return (tuple(items) if isinstance(value, tuple) else items), unusable
+    return value, False
+
+
+def sanitize_action_args(action: Action) -> Action:
+    """Return ``action`` with every arg leak-free (§3.2), else a ``wait`` fallback.
+
+    Walks all values AND keys (through nested dict/list/tuple). For comm actions
+    the ``to`` arg is recipient-validated first (a leaky ``to`` downgrades to
+    ``team`` rather than nuking the report). Leaky keys are dropped; a numeric
+    coordinate pair or an arg that scrubs to empty makes the action fall back to
+    ``wait``. Pure (no telemetry) so the run loop can apply it to every collected
+    action — the trace's ``ActionRecord``s stay leak-free regardless of which
+    worker produced them. Idempotent, so re-sanitizing an LLMWorker action is a
+    no-op."""
+    if not action.args:
+        return action
+    args = action.args
+    if action.name in (ActionName.REPORT, ActionName.REQUEST_HELP) and "to" in args:
+        args = {**args, "to": normalize_recipient(args.get("to"))}
+    sanitized, unusable = scrub_arg_value(args)
+    if unusable:
+        return Action(name=ActionName.WAIT)
+    if sanitized == action.args:
+        return action
+    return Action(name=action.name, args=sanitized)
 
 
 def guard_filter(memory: ExecutionMemory) -> ExecutionMemory:
@@ -148,6 +232,8 @@ __all__ = [
     "guard_filter",
     "looks_seed_specific",
     "scrub_seed_specific",
+    "scrub_arg_value",
+    "sanitize_action_args",
     "update_execution_memory",
     "NEUTRAL_BAND",
 ]
