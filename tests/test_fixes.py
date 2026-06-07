@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from bus.messages import _NAMED_AGENTS, normalize_recipient
 from contracts import Action
-from contracts.enums import ActionName, Role
+from contracts.enums import ActionName, Milestone, Role
 from env import StubEnv
 from env.techtree import canonical_item, craft_check
 from orca.cards import NAME_BY_ROLE
@@ -96,3 +96,27 @@ def test_named_recipients_not_downgraded():
 def test_recipient_allowlist_matches_roster():
     # Drift guard: every roster name must be an accepted recipient.
     assert set(NAME_BY_ROLE.values()) <= set(_NAMED_AGENTS)
+
+
+# --- 4. stronghold milestone is gated on its DAG prereq (eyes of ender) ---- #
+def test_stronghold_not_found_without_eyes():
+    env = StubEnv(seed="A", agents=[("agent_1", Role.MINER)]); env.reset()
+    env.world.discover(env.world.stronghold_id)  # wander in, no eyes
+    assert Milestone.STRONGHOLD_FOUND not in env.world.world_milestones
+
+
+def test_stronghold_found_with_eyes_on_hand():
+    env = StubEnv(seed="A", agents=[("agent_1", Role.MINER)]); env.reset()
+    env.world.agents["agent_1"].inventory["eye_of_ender"] = 1
+    env.world.discover(env.world.stronghold_id)
+    assert Milestone.STRONGHOLD_FOUND in env.world.world_milestones
+
+
+def test_stronghold_found_when_eyes_acquired_after_seeing():
+    # The realistic order: see the overworld cell early (no eyes), get eyes later.
+    env = StubEnv(seed="A", agents=[("agent_1", Role.MINER)]); env.reset()
+    env.world.discover(env.world.stronghold_id)
+    assert Milestone.STRONGHOLD_FOUND not in env.world.world_milestones
+    env.world.agents["agent_1"].inventory["eye_of_ender"] = 1
+    env.world.refresh_structure_milestones()  # the per-round re-check
+    assert Milestone.STRONGHOLD_FOUND in env.world.world_milestones

@@ -247,6 +247,11 @@ class StubEnv:
             srng = make_rng(self.seed, self.episode_idx, self.round_idx, aid + ":survival")
             self._survival_tick(agent, actions.get(aid), srng)
 
+        # Re-check prereq-gated structure milestones (STRONGHOLD_FOUND needs eyes
+        # of ender) now that this round's actions may have changed inventory, so the
+        # milestone fires even when the eyes are crafted after the cell was seen.
+        self.world.refresh_structure_milestones()
+
         # Update the (monotonic) max team frontier and timeline.
         detected = techtree.detect_frontier(
             self.world.pooled_inventory(), self.world.world_milestones
