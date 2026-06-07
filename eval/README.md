@@ -37,13 +37,38 @@ into `team_reward`, fed to the bandit's value, or used in the gate's decision.
 ## Reproduce
 
 ```bash
-python -m eval.run_eval                 # 5 figures -> figures/, results.json, printed report
-python -m eval.run_eval --weave         # also log the pitch trace + leaderboard live to Weave
-python -m eval.cost_model               # token/$ estimate for a REAL LLM-worker run
+python -m eval.run_eval                       # 5 figures -> figures/, results.json, report
+python -m eval.run_eval --config configs/deep.yaml   # use a preset (n_train/reps/depth/provider)
+python -m eval.run_eval --weave               # also log the pitch trace + leaderboard live to Weave
+python -m eval.cost_model                     # token/$ AND wall-clock estimate for a REAL run
 ```
 
 `figures/` is gitignored (reproducible). The run is deterministic (seeded via
 `env.rng.derive_seed`).
+
+## Config presets & the real run (ready for Streams 1+2)
+
+Presets in `configs/` carry `run.*` (depth, `t_max`, `worker_concurrency`),
+`seeds`, `llm` (provider), and an `eval` section (`n_train` / `eval_reps` /
+`gate_batch`). `run_eval --config <preset>` consumes them.
+
+| Preset | Depth | Notes |
+|---|---|---|
+| `configs/shallow.yaml` | iron (S1 only) | runnable once `LLMWorker` lands; ~$15, ~40 min async |
+| `configs/deep.yaml` | full DAG (S1–S4) | needs Stream 1's deep env; ~$83, ~3 h async |
+| `configs/deep_hero.yaml` | full DAG, bigger | the ~8–10 h headline run; GLM-worker hybrid + `worker_concurrency: 4` |
+
+- **GLM/gpt-5 hybrid:** set `llm.worker_provider: wandb_inference` (workers → GLM
+  on W&B credits, no rate limit) while Orca stays on gpt-5. `build_llm` resolves
+  provider per role; set the confirmed GLM-5.1 id in `wandb_inference_model`.
+- **Concurrency:** `run.worker_concurrency > 1` runs a round's worker calls on a
+  thread pool (~4× on the worker portion). Default 1 keeps the Weave trace tree
+  intact; under threading the per-call `@op` spans don't nest (documented caveat).
+- **Model-swap ablation:** `harness.run_provider_ablation({"gpt-5-mini": s1,
+  "GLM": s2}, worker_factory=...)` runs the transfer under each provider
+  (RealRunner-only; ties offline with the oracle).
+- **Time/cost:** `python -m eval.cost_model` prints $ and hours per scenario;
+  the training spine is sequential (online learning), eval/ablations parallelize.
 
 ## The five figures
 

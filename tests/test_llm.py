@@ -36,6 +36,31 @@ def test_build_llm_wandb_inference_provider():
     assert client._api_key_env == "WANDB_INFERENCE_API_KEY"
 
 
+def test_build_llm_per_role_hybrid():
+    # GLM workers (W&B Inference) + gpt-5 Orca (OpenAI) via per-role providers.
+    cfg = load_config()
+    cfg.llm.provider = "openai"
+    cfg.llm.worker_provider = "wandb_inference"  # workers -> GLM
+    # orca_provider unset -> falls back to provider "openai"
+    worker = build_llm("worker", cfg)
+    orca = build_llm("orca", cfg)
+    assert worker.model == cfg.llm.wandb_inference_model
+    assert worker._base_url == cfg.llm.wandb_inference_base_url
+    assert worker._api_key_env == "WANDB_INFERENCE_API_KEY"
+    assert orca.model == cfg.llm.orca_model
+    assert orca._api_key_env == "OPENAI_API_KEY"
+
+
+def test_build_llm_wandb_inference_distinct_orca_model():
+    cfg = load_config()
+    cfg.llm.provider = "wandb_inference"
+    cfg.llm.wandb_inference_orca_model = "zai-org/GLM-4.6-bigger"
+    worker = build_llm("worker", cfg)
+    orca = build_llm("orca", cfg)
+    assert worker.model == cfg.llm.wandb_inference_model
+    assert orca.model == "zai-org/GLM-4.6-bigger"
+
+
 def test_openai_client_constructs_without_key():
     # Lazy: construction must not require a key (keeps pytest offline).
     c = OpenAIClient(model="gpt-5-mini")

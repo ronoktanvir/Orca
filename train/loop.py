@@ -53,6 +53,48 @@ def env_step(env: StubEnv, actions: dict):
     return env.step(actions)
 
 
+def _round_actions(
+    agents: list, env: StubEnv, obs_snapshots: list[dict], telemetry: Telemetry, concurrency: int
+) -> dict:
+    """Collect one round's actions. Observe is sequential (reads world state);
+    the worker LLM calls run concurrently across agents when ``concurrency > 1``.
+
+    The actions/snapshots/logs are assembled in fixed agent order regardless of
+    thread completion, so results stay deterministic. Note: under threading the
+    per-call ``@op`` Weave spans don't nest under the round (a known thread-context
+    limitation); the default ``concurrency=1`` keeps the trace tree intact."""
+    obs_by = []
+    for agent in agents:
+        obs = env.observe(agent.agent_id)
+        obs_snapshots.append(obs.model_dump(mode="json", by_alias=True))
+        obs_by.append((agent, obs))
+
+    if concurrency and concurrency > 1 and len(obs_by) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Call agent.act directly (not the @op-wrapped worker_turn): Weave's op
+        # context-vars don't cross threads, so wrapping here could raise in weave
+        # mode and the spans wouldn't nest anyway. The sequential path keeps @op.
+        with ThreadPoolExecutor(max_workers=min(concurrency, len(obs_by))) as ex:
+            results = list(ex.map(lambda ao: ao[0].act(ao[1]), obs_by))
+    else:
+        results = [worker_turn(agent, obs) for agent, obs in obs_by]
+
+    actions = {}
+    for (agent, _obs), action in zip(obs_by, results):
+        actions[agent.agent_id] = action
+        telemetry.log_event(
+            "worker_turn",
+            {
+                "round": env.round_idx,
+                "agent": agent.agent_id,
+                "action": action.name.value,
+                "args": action.args,
+            },
+        )
+    return actions
+
+
 @op
 def run_episode(
     env: StubEnv,
@@ -67,23 +109,10 @@ def run_episode(
     """Run one full episode end-to-end; emit EpisodeTrace + EpisodeMetrics (§8)."""
     env.reset()
     obs_snapshots: list[dict] = []
+    concurrency = getattr(settings.run, "worker_concurrency", 1)
 
     while not env.done:
-        actions = {}
-        for agent in agents:
-            obs = env.observe(agent.agent_id)
-            obs_snapshots.append(obs.model_dump(mode="json", by_alias=True))
-            action = worker_turn(agent, obs)
-            actions[agent.agent_id] = action
-            telemetry.log_event(
-                "worker_turn",
-                {
-                    "round": env.round_idx,
-                    "agent": agent.agent_id,
-                    "action": action.name.value,
-                    "args": action.args,
-                },
-            )
+        actions = _round_actions(agents, env, obs_snapshots, telemetry, concurrency)
         env_step(env, actions)
 
     trace = EpisodeTrace(

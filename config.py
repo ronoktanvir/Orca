@@ -51,6 +51,7 @@ class RunConfig(BaseModel):
     stop_at_milestone: Optional[str] = "iron"  # Phase 0 shallow target
     message_window: int = 8
     single_agent_oracle: bool = True  # Phase 0 uses the scripted oracle
+    worker_concurrency: int = 1  # >1 => run a round's worker calls concurrently (threads)
 
 
 class AgentsConfig(BaseModel):
@@ -58,16 +59,25 @@ class AgentsConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    """Swappable model config (§11). provider: openai | wandb_inference."""
+    """Swappable model config (§11). provider: openai | wandb_inference.
+
+    ``provider`` is the global default; ``worker_provider`` / ``orca_provider``
+    override it *per role* so you can run the cost/throughput hybrid — high-volume
+    workers on GLM via W&B Inference (no rate limit, $50 credits) and Orca on
+    gpt-5 — by setting ``worker_provider: wandb_inference`` and leaving
+    ``orca_provider`` unset (falls back to ``provider: openai``)."""
 
     provider: str = "openai"
+    worker_provider: Optional[str] = None  # overrides provider for the 4 workers
+    orca_provider: Optional[str] = None  # overrides provider for Orca
     worker_model: str = "gpt-5-mini"  # 4 workers: cheap/fast, high call volume
     orca_model: str = "gpt-5"  # Orca: strong reasoning, 1 call/episode
     temperature: float = 0.2  # §15
     openai_base_url: Optional[str] = None  # None => api.openai.com
-    # W&B Inference (GLM-5.1) — billed to W&B credits; an alternate/ablation provider.
+    # W&B Inference (GLM) — billed to W&B credits; an alternate/ablation provider.
     wandb_inference_base_url: str = "https://api.inference.wandb.ai/v1"
     wandb_inference_model: str = "zai-org/GLM-4.6"  # set to the GLM-5.1 id when confirmed
+    wandb_inference_orca_model: Optional[str] = None  # optional distinct GLM model for Orca
 
 
 class RewardConfig(BaseModel):
@@ -90,6 +100,14 @@ class SeedsConfig(BaseModel):
     heldout: list[str] = Field(default_factory=lambda: ["B", "C"])
 
 
+class EvalConfig(BaseModel):
+    """Eval-campaign knobs (§9), read by ``eval.run_eval`` / the harness."""
+
+    n_train: int = 40  # Full C2 training episodes
+    eval_reps: int = 8  # eval repetitions per seed (variance)
+    gate_batch: int = 2  # train-pool episodes the accept-gate re-runs per coach episode
+
+
 class TelemetryConfig(BaseModel):
     mode: str = "auto"  # auto | weave | local | off
     entity: Optional[str] = None  # W&B entity (team); None => W&B default entity
@@ -105,6 +123,7 @@ class OrcaSettings(BaseModel):
     bandit: BanditConfig = Field(default_factory=BanditConfig)
     phases: PhasesConfig = Field(default_factory=PhasesConfig)
     seeds: SeedsConfig = Field(default_factory=SeedsConfig)
+    eval: EvalConfig = Field(default_factory=EvalConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
 
 

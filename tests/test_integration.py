@@ -84,6 +84,50 @@ def test_realrunner_drives_mock_worker_through_real_pipeline():
     assert any(st.performance_score > 0 for st in metrics.agent_stats)
 
 
+def test_worker_concurrency_matches_sequential_and_overlaps():
+    # The concurrent (threaded) round path must give identical results to the
+    # sequential path, and must actually run the workers concurrently.
+    import time
+
+    from config import load_config
+    from eval.harness import FULL_C2_SPEC, RealRunner, make_orca
+
+    class _SlowWorker:
+        def __init__(self, agent_id, role, llm):
+            self.agent_id = agent_id
+            self._policy = ShallowOracle(agent_id)
+
+        def act(self, obs):
+            time.sleep(0.02)  # simulate LLM latency
+            return self._policy.act(obs)
+
+    def factory(aid, role, llm):
+        return _SlowWorker(aid, role, llm)
+
+    settings = load_config()
+    settings.telemetry.mode = "off"
+    orca = make_orca(FULL_C2_SPEC, settings)
+    config = orca.choose_config(greedy=True)
+
+    def run_with(conc):
+        s = load_config()
+        s.telemetry.mode = "off"
+        s.run.worker_concurrency = conc
+        runner = RealRunner(s, telemetry=init_telemetry(mode="off"), worker_factory=factory)
+        t0 = time.perf_counter()
+        _trace, metrics = runner(config, "A", condition=FULL_C2, episode_idx=0)
+        return metrics, time.perf_counter() - t0
+
+    m_seq, t_seq = run_with(1)
+    m_par, t_par = run_with(4)
+
+    # identical objective outcome regardless of concurrency
+    assert m_seq.frontier_milestone == m_par.frontier_milestone
+    assert m_seq.invalid_rate == m_par.invalid_rate
+    # concurrent is faster (4 workers/round overlap their 0.02s sleeps)
+    assert t_par < t_seq
+
+
 def test_run_loop_with_worker_factory_offline():
     settings = load_config()
     settings.telemetry.mode = "off"

@@ -1,0 +1,20 @@
+# Deep-hero preset — the ~8-10h headline run: deep env, more episodes/reps, and
+# the GLM-workers + gpt-5-Orca hybrid (W&B's no-rate-limit credits absorb the
+# high-volume worker calls; OpenAI funds only Orca's 1 call/episode).
+# NEEDS Stream 1 (deep env) + Stream 2 (LLMWorker). Set the GLM-5.1 id below.
+
+run:
+  t_max: 600
+  stop_at_milestone: null
+  single_agent_oracle: false
+  worker_concurrency: 4          # run the 4 workers' calls concurrently per round (~4x)
+
+llm:
+  provider: "openai"                    # Orca stays on gpt-5 (global default)
+  worker_provider: "wandb_inference"    # workers -> GLM via W&B Inference
+  wandb_inference_model: "zai-org/GLM-4.6"   # <-- set to the confirmed GLM-5.1 id
+
+eval:
+  n_train: 60
+  eval_reps: 12
+  gate_batch: 3

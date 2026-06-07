@@ -39,13 +39,18 @@ CAVEAT = (
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Run the Orca eval + produce the headline figures.")
+    p.add_argument("--config", default=None, help="path to a preset YAML (e.g. configs/deep.yaml)")
     p.add_argument("--out", default="figures", help="output directory for figures + results.json")
-    p.add_argument("--episodes", type=int, default=40, help="training episodes for Full C2")
-    p.add_argument("--reps", type=int, default=8, help="eval repetitions per seed")
+    p.add_argument("--episodes", type=int, default=None, help="override eval.n_train")
+    p.add_argument("--reps", type=int, default=None, help="override eval.eval_reps")
     p.add_argument("--weave", action="store_true", help="init Weave so the pitch trace logs live")
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
 
-    settings = load_config()
+    settings = load_config(args.config)
+    # eval knobs: CLI overrides the preset's eval.* section
+    n_train = args.episodes if args.episodes is not None else settings.eval.n_train
+    eval_reps = args.reps if args.reps is not None else settings.eval.eval_reps
+    gate_batch = settings.eval.gate_batch
     telemetry = None
     if args.weave:
         load_dotenv()
@@ -62,16 +67,18 @@ def main(argv: list[str] | None = None) -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
+    print(f"[eval] config={args.config or 'default'} · n_train={n_train} · reps={eval_reps} "
+          f"· gate_batch={gate_batch} · provider={settings.llm.worker_provider or settings.llm.provider}")
     print(f"[eval] generating figures -> {out}/ ...")
-    fig_paths = make_all_plots(out, n_train=args.episodes, eval_reps=args.reps)
+    fig_paths = make_all_plots(out, n_train=n_train, eval_reps=eval_reps, gate_batch=gate_batch)
 
     print("[eval] running transfer experiment ...")
-    transfer = run_transfer(n_train=args.episodes, eval_reps=args.reps)
+    transfer = run_transfer(settings, n_train=n_train, eval_reps=eval_reps, gate_batch=gate_batch)
     verdict = transfer_verdict(transfer.records)
     transfer_stats = summarize(transfer.records)
 
     print("[eval] building Weave leaderboard ...")
-    by_cond = evaluate_conditions(n_train=args.episodes, reps=args.reps)
+    by_cond = evaluate_conditions(settings, n_train=n_train, reps=eval_reps, gate_batch=gate_batch)
     leaderboard = build_leaderboard(by_cond)
 
     print("[eval] capturing the pitch trace (failure -> fix -> improve) ...")

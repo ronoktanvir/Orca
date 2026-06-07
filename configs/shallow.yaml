@@ -1,0 +1,13 @@
+# Shallow preset — the iron-depth campaign (only S1 role-assignment is exercised).
+# Runnable TODAY once Stream 2's LLMWorker lands (uses the existing stub env).
+# Fast/cheap (~$15, ~40 min async). Overrides only; everything else = default.yaml.
+
+run:
+  t_max: 120
+  stop_at_milestone: "iron"      # shallow target
+  single_agent_oracle: false     # real 4-agent Orca path (not the 1-agent smoke)
+
+eval:
+  n_train: 30
+  eval_reps: 8
+  gate_batch: 2
