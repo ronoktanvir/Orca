@@ -84,6 +84,7 @@ def evaluate_conditions(
     seeds: Optional[list[str]] = None,
     n_train: int = 30,
     reps: int = 6,
+    gate_batch: int = 2,
 ) -> dict[str, list[tuple[EpisodeTrace, EpisodeMetrics]]]:
     """Train Full C2, freeze all three conditions, eval on ``seeds`` (default held-out)."""
     settings = settings or load_config()
@@ -91,7 +92,7 @@ def evaluate_conditions(
     seeds = seeds if seeds is not None else list(settings.seeds.heldout)
 
     by_cond: dict[str, list[tuple[EpisodeTrace, EpisodeMetrics]]] = {}
-    tr = train_full_c2(FULL_C2_SPEC, settings, runner, list(settings.seeds.train), n_train)
+    tr = train_full_c2(FULL_C2_SPEC, settings, runner, list(settings.seeds.train), n_train, gate_batch=gate_batch)
     by_cond[FULL_C2_SPEC.name] = _run_condition(tr.orca, runner, FULL_C2_SPEC, seeds, reps)
     for spec in (STATIC_SPEC, COMMS_SPEC):
         orca = make_orca(spec, settings)
@@ -108,6 +109,7 @@ def run_weave_evaluation(
     telemetry: Any = None,
     n_train: int = 30,
     reps: int = 6,
+    gate_batch: int = 2,
 ) -> dict[str, dict[str, float]]:
     """Score every condition and emit the leaderboard (§10).
 
@@ -116,7 +118,7 @@ def run_weave_evaluation(
     leaderboard either way.
     """
     settings = settings or load_config()
-    by_cond = evaluate_conditions(settings, runner=runner, n_train=n_train, reps=reps)
+    by_cond = evaluate_conditions(settings, runner=runner, n_train=n_train, reps=reps, gate_batch=gate_batch)
     leaderboard = build_leaderboard(by_cond)
 
     if telemetry is not None:

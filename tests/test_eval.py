@@ -138,6 +138,26 @@ def test_pitch_trace_shows_failure_fix_improve():
 # --------------------------------------------------------------------------- #
 # Sim runner sanity — no LLM needed
 # --------------------------------------------------------------------------- #
+def test_provider_ablation_scaffold_runs():
+    # Offline (oracle) the LLM config is ignored, so both providers tie — this just
+    # checks the scaffold runs and returns a labeled TransferResult per variant.
+    from copy import deepcopy
+
+    from eval.harness import run_provider_ablation
+
+    base = load_config()
+    base.telemetry.mode = "off"
+    glm = deepcopy(base)
+    glm.llm.worker_provider = "wandb_inference"
+    out = run_provider_ablation(
+        {"openai": base, "glm": glm}, n_train=6, eval_reps=2, gate_batch=1
+    )
+    assert set(out.keys()) == {"openai", "glm"}
+    for label, tr in out.items():
+        assert tr.records  # produced transfer records
+        assert tr.train_result.orca.trained_seeds.isdisjoint(set(base.seeds.heldout))
+
+
 def test_sim_runner_produces_consistent_episode():
     from eval.harness import make_orca
     from eval.outcome_model import FULL_C2

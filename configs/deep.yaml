@@ -1,0 +1,14 @@
+# Deep preset — full-DAG campaign to the dragon. Activates S2 (nether), S3
+# (fortress), S4 (end) + the Phase-2 speed reward. NEEDS Stream 1's deep env; with
+# today's stub env it simply runs to t_max at iron. ~$83, ~3h spine async.
+
+run:
+  t_max: 400
+  stop_at_milestone: null        # run until a win or t_max (not capped at iron)
+  single_agent_oracle: false
+  worker_concurrency: 4          # run the 4 workers' calls concurrently per round
+
+eval:
+  n_train: 40
+  eval_reps: 8
+  gate_batch: 2

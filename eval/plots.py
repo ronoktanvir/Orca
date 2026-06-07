@@ -230,15 +230,18 @@ def make_all_plots(
     runner=None,
     n_train: int = 40,
     eval_reps: int = 8,
+    gate_batch: int = 2,
 ) -> dict[str, Path]:
     """Run the experiments and write all five figures; return their paths (§9)."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     source = _source_label(runner)
 
-    lc = run_learning_curve(n_train=n_train, runner=runner)
-    transfer: TransferResult = run_transfer(n_train=n_train, eval_reps=eval_reps, runner=runner)
-    ablation = run_ablations(n_train=n_train, eval_reps=eval_reps, runner=runner)
+    lc = run_learning_curve(n_train=n_train, runner=runner, gate_batch=gate_batch)
+    transfer: TransferResult = run_transfer(
+        n_train=n_train, eval_reps=eval_reps, runner=runner, gate_batch=gate_batch
+    )
+    ablation = run_ablations(n_train=n_train, eval_reps=eval_reps, runner=runner, gate_batch=gate_batch)
 
     paths = {
         "learning_curve": plot_learning_curve(lc, out / "learning_curve.png", source=source),

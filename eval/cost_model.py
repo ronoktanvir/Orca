@@ -39,6 +39,17 @@ class Prices:
 
 
 @dataclass
+class Latency:
+    """Wall-clock assumptions. ILLUSTRATIVE — the Orca reasoning model is the big
+    unknown (10–60s); double it and the training spine roughly doubles."""
+
+    worker_s: float = 2.0  # one worker (gpt-5-mini) call
+    orca_s: float = 20.0  # one Orca coach (gpt-5 reasoning) call
+    async_workers: bool = True  # 4 workers concurrent within a round (loop scaffold)
+    eval_concurrency: int = 20  # parallel episodes for the embarrassingly-parallel parts
+
+
+@dataclass
 class Assumptions:
     n_workers: int = 4
     rounds_per_episode: int = 14  # shallow=~14 (iron), deep can approach T_max
@@ -161,6 +172,40 @@ def campaign(a: Assumptions | None = None) -> list[CostLine]:
     return lines
 
 
+def _training_seconds(a: Assumptions, lat: Latency, *, coach: bool, gate: bool) -> float:
+    """Critical-path seconds for one training run.
+
+    ALL episodes are sequential — the main episodes (online learning) *and* the
+    gate batch, which ``_gate_eval_batch`` runs one after another. The only
+    concurrency is the 4 workers WITHIN a round (``round_s``). So async and sync
+    have the same round count and differ only in per-round latency."""
+    R = a.rounds_per_episode
+    p1 = max(0, a.n_train - a.phase0_length) if coach else 0
+    round_s = lat.worker_s if lat.async_workers else lat.worker_s * a.n_workers
+    gate_eps = p1 * a.gate_batch if (coach and gate) else 0
+    rounds = (a.n_train + gate_eps) * R
+    return rounds * round_s + p1 * lat.orca_s
+
+
+def time_estimate(a: Assumptions, lat: Latency) -> dict:
+    """Wall-clock hours: the sequential training spine + the parallel remainder.
+
+    Training episodes are inherently sequential (online learning); eval episodes
+    and the 3 ablation trainings are independent (parallelizable)."""
+    import math
+
+    t_train = _training_seconds(a, lat, coach=True, gate=True)
+    t_abl_seq = sum(_training_seconds(a, lat, coach=c, gate=g) for _n, c, g in _ABLATIONS)
+    seeds = a.n_train_seeds + a.n_heldout_seeds
+    eval_eps = a.n_conditions * seeds * a.eval_reps + len(_ABLATIONS) * a.n_heldout_seeds * a.eval_reps
+    t_eval = math.ceil(eval_eps / max(1, lat.eval_concurrency)) * a.rounds_per_episode * lat.worker_s
+    return {
+        "one_training_h": t_train / 3600,
+        "full_seq_ablations_h": (t_train + t_abl_seq + t_eval) / 3600,
+        "full_par_ablations_h": (t_train + t_eval) / 3600,  # ablations overlap the spine
+    }
+
+
 def summarize(lines: list[CostLine], p: Prices) -> dict:
     total = sum(_price(ln, p) for ln in lines)
     wcalls = sum(ln.worker_calls for ln in lines)
@@ -198,6 +243,24 @@ def main() -> int:
     for name, d in (("shallow", d1), ("deep", d2), ("deep-lean", d3)):
         verdict = "OK" if d <= 150 else "OVER — reduce n_train / gate_batch / eval_reps"
         print(f"  {name:<10}: ${d:>8.2f}  [{verdict}]")
+
+    print("\n## Wall-clock (ILLUSTRATIVE latency; the training spine is sequential)")
+    def _h(x: float) -> str:
+        return f"{x*60:.0f} min" if x < 1.5 else f"{x:.1f} h"
+    print(f"  {'scenario':<26}{'1 training':>12}{'full (par.abl)':>16}{'full (seq.abl)':>16}")
+    rows = [
+        ("shallow, async", shallow, Latency(async_workers=True)),
+        ("shallow, sync", shallow, Latency(async_workers=False)),
+        ("deep, async", deep, Latency(async_workers=True)),
+        ("deep, sync", deep, Latency(async_workers=False)),
+    ]
+    for name, a, lat in rows:
+        t = time_estimate(a, lat)
+        print(f"  {name:<26}{_h(t['one_training_h']):>12}{_h(t['full_par_ablations_h']):>16}{_h(t['full_seq_ablations_h']):>16}")
+    print("  async parallelizes the 4 workers WITHIN a round (~4x on the worker portion "
+          "via worker_concurrency); overall speedup is < 4x since the Orca coach calls "
+          "and the sequential gate-batch episodes don't shrink. Coach latency is the big "
+          "uncertainty. (No across-episode concurrency exists in the loop.)")
     print("\nLevers, by impact: gate_batch (multiplies Phase-1 worker calls; a real "
           "knob via train_full_c2(gate_batch=...)), ablation re-trainings, "
           "rounds/episode (T_max), eval_reps, n_train.")

@@ -314,6 +314,7 @@ def run_transfer(
     runner: Optional[Runner] = None,
     n_train: int = 30,
     eval_reps: int = 6,
+    gate_batch: int = 2,
     llm=None,
 ) -> TransferResult:
     """The money plot data: train Full C2 on train seeds, eval all 3 on B/C (§9)."""
@@ -323,7 +324,7 @@ def run_transfer(
     heldout = list(settings.seeds.heldout)
 
     records: list[EpisodeRecord] = []
-    tr = train_full_c2(FULL_C2_SPEC, settings, runner, train_seeds, n_train, llm=llm)
+    tr = train_full_c2(FULL_C2_SPEC, settings, runner, train_seeds, n_train, llm=llm, gate_batch=gate_batch)
     records += eval_batch(tr.orca, runner, train_seeds, FULL_C2_SPEC, TRAIN, reps=eval_reps)
     records += eval_batch(tr.orca, runner, heldout, FULL_C2_SPEC, HELDOUT, reps=eval_reps)
 
@@ -342,6 +343,7 @@ def run_ablations(
     runner: Optional[Runner] = None,
     n_train: int = 30,
     eval_reps: int = 6,
+    gate_batch: int = 2,
     llm=None,
 ) -> list[EpisodeRecord]:
     """Full C2 vs. memory-off / coaching-off / gate-off, evaluated on held-out (§9)."""
@@ -352,9 +354,40 @@ def run_ablations(
 
     records: list[EpisodeRecord] = []
     for spec in (FULL_C2_SPEC, ABL_NO_MEMORY, ABL_NO_COACH, ABL_NO_GATE):
-        tr = train_full_c2(spec, settings, runner, train_seeds, n_train, llm=llm)
+        tr = train_full_c2(spec, settings, runner, train_seeds, n_train, llm=llm, gate_batch=gate_batch)
         records += eval_batch(tr.orca, runner, heldout, spec, HELDOUT, reps=eval_reps)
     return records
+
+
+def run_provider_ablation(
+    variants: dict[str, OrcaSettings],
+    *,
+    worker_factory: Optional[Callable] = None,
+    n_train: int = 30,
+    eval_reps: int = 6,
+    gate_batch: int = 2,
+) -> dict[str, TransferResult]:
+    """Model-swap ablation: run the transfer under each LLM config, tagged by label.
+
+    ``variants`` maps a label (e.g. "gpt-5-mini" / "GLM-5.1") to an ``OrcaSettings``
+    whose ``llm`` section selects that provider/model. Each variant runs through a
+    :class:`RealRunner` with workers built from *that* settings, so the comparison
+    reflects the real model swap.
+
+    REAL-runner only: this is meaningful once Stream 2's ``LLMWorker`` is wired in
+    via ``worker_factory`` — with the scripted oracle (``worker_factory=None``) the
+    LLM config is ignored and every variant ties (a documented no-op offline).
+    """
+    from llm import build_llm
+
+    out: dict[str, TransferResult] = {}
+    for label, vs in variants.items():
+        worker_llm = build_llm("worker", vs) if worker_factory is not None else None
+        runner = RealRunner(vs, llm=worker_llm, worker_factory=worker_factory)
+        out[label] = run_transfer(
+            vs, runner=runner, n_train=n_train, eval_reps=eval_reps, gate_batch=gate_batch
+        )
+    return out
 
 
 def run_learning_curve(
@@ -362,12 +395,15 @@ def run_learning_curve(
     *,
     runner: Optional[Runner] = None,
     n_train: int = 40,
+    gate_batch: int = 2,
     llm=None,
 ) -> TrainResult:
     """Train Full C2 and return per-episode learning + bandit value snapshots (§9)."""
     settings = settings or load_config()
     runner = runner or SimRunner()
-    return train_full_c2(FULL_C2_SPEC, settings, runner, list(settings.seeds.train), n_train, llm=llm)
+    return train_full_c2(
+        FULL_C2_SPEC, settings, runner, list(settings.seeds.train), n_train, llm=llm, gate_batch=gate_batch
+    )
 
 
 __all__ = [
@@ -386,6 +422,7 @@ __all__ = [
     "TrainResult",
     "run_transfer",
     "run_ablations",
+    "run_provider_ablation",
     "run_learning_curve",
     "TransferResult",
 ]

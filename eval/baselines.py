@@ -36,15 +36,17 @@ def run_baselines(
     runner: Optional[Runner] = None,
     n_train: int = 30,
     eval_reps: int = 6,
+    gate_batch: Optional[int] = None,
 ) -> list[EpisodeRecord]:
     """Eval all three conditions on train + held-out; Full C2 is trained first."""
     settings = settings or load_config()
     runner = runner or SimRunner()
+    gate_batch = settings.eval.gate_batch if gate_batch is None else gate_batch
     train_seeds = list(settings.seeds.train)
     heldout = list(settings.seeds.heldout)
 
     records: list[EpisodeRecord] = []
-    tr = train_full_c2(FULL_C2_SPEC, settings, runner, train_seeds, n_train)
+    tr = train_full_c2(FULL_C2_SPEC, settings, runner, train_seeds, n_train, gate_batch=gate_batch)
     records += eval_batch(tr.orca, runner, train_seeds, FULL_C2_SPEC, TRAIN, reps=eval_reps)
     records += eval_batch(tr.orca, runner, heldout, FULL_C2_SPEC, HELDOUT, reps=eval_reps)
     for spec in (STATIC_SPEC, COMMS_SPEC):

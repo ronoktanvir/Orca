@@ -114,23 +114,40 @@ class OpenAIClient:
         return resp.choices[0].message.content or ""
 
 
+def _provider_for(role: str, cfg: Any) -> str:
+    """Resolve the provider for ``role`` (per-role override -> global default)."""
+    per_role = cfg.orca_provider if role == "orca" else cfg.worker_provider
+    return per_role or cfg.provider
+
+
 def build_llm(role: str, settings: Any) -> LLMClient:
     """Construct the configured LLM for a role ('worker' | 'orca') (§11).
 
-    provider 'openai' -> worker_model / orca_model on the OpenAI API.
-    provider 'wandb_inference' -> a single model (e.g. GLM-5.1) on the W&B
-    Inference OpenAI-compatible endpoint, billed to the $50 W&B credits.
+    Provider is resolved per role (``worker_provider`` / ``orca_provider`` override
+    the global ``provider``), enabling the hybrid: GLM workers (W&B Inference) +
+    gpt-5 Orca (OpenAI).
+      * 'openai'          -> worker_model / orca_model on the OpenAI API.
+      * 'wandb_inference' -> GLM on the W&B Inference OpenAI-compatible endpoint
+        (worker uses ``wandb_inference_model``; Orca uses
+        ``wandb_inference_orca_model`` if set, else the same), billed to W&B credits.
     """
     cfg = settings.llm
-    if cfg.provider == "wandb_inference":
+    provider = _provider_for(role, cfg)
+    if provider == "wandb_inference":
         headers = None
-        entity = os.environ.get("WANDB_ENTITY")
-        project = os.environ.get("WANDB_PROJECT", "orca")
+        # Prefer the configured telemetry identifiers (single source of truth),
+        # falling back to env vars — so usage attribution matches the Weave run.
+        tel = getattr(settings, "telemetry", None)
+        entity = (getattr(tel, "entity", None) if tel else None) or os.environ.get("WANDB_ENTITY")
+        project = (getattr(tel, "project", None) if tel else None) or os.environ.get("WANDB_PROJECT", "orca")
         if entity:
             # W&B Inference attributes usage to a project via this header.
             headers = {"OpenAI-Project": f"{entity}/{project}"}
+        model = cfg.wandb_inference_model
+        if role == "orca" and cfg.wandb_inference_orca_model:
+            model = cfg.wandb_inference_orca_model
         return OpenAIClient(
-            model=cfg.wandb_inference_model,
+            model=model,
             temperature=cfg.temperature,
             api_key_env="WANDB_INFERENCE_API_KEY",
             base_url=cfg.wandb_inference_base_url,
