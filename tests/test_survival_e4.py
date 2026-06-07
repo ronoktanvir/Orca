@@ -9,14 +9,18 @@ The iron path and the full-DAG oracle stay intact.
 
 from __future__ import annotations
 
+from random import Random
+
 import pytest
 
 from contracts import Action
-from contracts.enums import ActionName, Milestone, Role
-from env import StubEnv
+from contracts.enums import ActionName, Biome, Layer, Milestone, Role
+from env import StubEnv, techtree
+from env.actions import resolve_action
 from env.oracle import validate_winnable
 from env.seeds import ALL_SEEDS
 from env.stub_env import _RESPAWN_COST
+from env.world import AgentState, Region, World
 
 
 def _env(seed="A", t_max=80):
@@ -147,3 +151,47 @@ def test_iron_path_intact_with_hunger_on():
 @pytest.mark.parametrize("seed", ALL_SEEDS)
 def test_oracle_still_reaches_dragon_without_starving(seed):
     assert validate_winnable(seed) is True
+
+
+# =========================================================================== #
+# SLEEP + survival-tier milestones (STABLE_FOOD / SHELTER)
+# =========================================================================== #
+def _region_world(biome, layer, structure=None) -> tuple[World, AgentState]:
+    region = Region(id="r0", biome=biome, pos=(0.0, 0.0), layer=layer, structure=structure, discovered=True)
+    world = World(regions={"r0": region}, start_region_id="r0")
+    agent = AgentState(agent_id="a", role=Role.SUPPORT, region_id="r0")
+    world.add_agent(agent)
+    return world, agent
+
+
+def test_sleep_in_safe_overworld_restores_health_and_marks_shelter():
+    world, a = _region_world(Biome.FOREST, Layer.OVERWORLD)
+    a.health = 0.3
+    rec = resolve_action(world, a, Action(name=ActionName.SLEEP), Random(0), 0).record
+    assert rec.valid is True
+    assert a.health > 0.3                            # a safe rest restores some health
+    assert Milestone.SHELTER in world.world_milestones
+
+
+def test_sleep_unsafe_with_hostiles_rejected():
+    # The Nether is always hostile (piglins) -> sleeping there is invalid, no SHELTER.
+    world, a = _region_world(Biome.NETHER_WASTES, Layer.NETHER)
+    rec = resolve_action(world, a, Action(name=ActionName.SLEEP), Random(0), 0).record
+    assert rec.valid is False
+    assert "unsafe" in (rec.reason or "")
+    assert Milestone.SHELTER not in world.world_milestones
+
+
+def test_stable_food_milestone_detected_from_cooked_food():
+    # The reviewer's repro: cooked food on hand registers STABLE_FOOD, not START.
+    assert techtree.detect_milestone({"cooked_food": 1}) == Milestone.STABLE_FOOD
+
+
+def test_iron_dominates_stable_food_in_frontier():
+    # Max-frontier: a deeper milestone still wins when both are present (§7.1).
+    assert techtree.detect_milestone({"cooked_food": 1, "iron_ingot": 1}) == Milestone.IRON
+
+
+def test_shelter_folds_into_team_frontier():
+    # SHELTER is world-state (not an inventory token); detect_frontier must fold it.
+    assert techtree.detect_frontier({}, {Milestone.SHELTER}) == Milestone.SHELTER

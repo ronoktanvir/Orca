@@ -339,6 +339,11 @@ def detect_milestone(pooled_inventory: dict[str, int]) -> Milestone:
         reached = Milestone.WOODEN_TOOLS
     if inv.get("stone_pickaxe", 0) > 0:
         reached = Milestone.STONE_TOOLS
+    # STABLE_FOOD: the team can feed itself — cooked food on hand (§3.4 survival
+    # tier). Inventory-detectable; the next tier, SHELTER, is world-state (set by a
+    # safe SLEEP in actions.py) and is folded in via detect_frontier, not here.
+    if inv.get("cooked_food", 0) > 0:
+        reached = Milestone.STABLE_FOOD
     # IRON: ore in hand (shallow oracle) OR a smelted ingot (deep tree).
     if inv.get("iron_ore", 0) > 0 or inv.get("iron_ingot", 0) > 0:
         reached = Milestone.IRON
@@ -357,12 +362,13 @@ def detect_milestone(pooled_inventory: dict[str, int]) -> Milestone:
     if inv.get("eye_of_ender", 0) > 0:  # ~12 needed to activate the end portal
         reached = Milestone.EYES_OF_ENDER
 
-    # --- world-state / location milestones: STUBBED; detection lands in E6 --- #
-    # These need geometry the stub env doesn't expose yet, and detect_milestone
-    # only sees pooled inventory — so they must NOT be faked off inventory tokens
-    # (a crafted ``nether_portal``/``end_portal`` token does not imply the portal
-    # was placed + lit in the world). They stay craftable (RECIPES) but undetected.
-    # TODO E6: wire location/world-state detection for:
+    # --- world-state / location milestones --------------------------------- #
+    # detect_milestone only sees pooled inventory, so these must NOT be faked off
+    # inventory tokens (a crafted ``nether_portal``/``end_portal`` token does not
+    # imply the portal was placed + lit in the world). Instead the env records them
+    # on ``World.world_milestones`` as they happen, and detect_frontier folds them
+    # in. SHELTER is recorded by a safe SLEEP (actions.py); the rest are recorded
+    # on arrival / discovery / combat:
     #   PORTAL_BUILT       — nether_portal frame placed (10 obsidian) + lit
     #   NETHER_ENTERED     — an agent has stepped through into Layer.NETHER
     #   FORTRESS_FOUND     — a fortress structure has been discovered
