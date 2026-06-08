@@ -1,0 +1,103 @@
+{
+  "result_source": "calibrated_outcome_model",
+  "caveat": "OFFLINE CALIBRATED OUTCOME-MODEL RESULT (eval/outcome_model.py) \u2014 a CI/demo scaffold, NOT the real LLM-worker env. Real-system transfer is unproven until Stream 2's LLMWorker is evaluated via RealRunner.",
+  "figures": {
+    "learning_curve": "results/learning_curve.png",
+    "bandit_values": "results/bandit_values.png",
+    "transfer": "results/transfer.png",
+    "ablation": "results/ablation.png",
+    "invalid_rate": "results/invalid_rate.png"
+  },
+  "transfer_verdict": {
+    "full_c2_heldout": 0.759,
+    "static_heldout": 0.309,
+    "comms_heldout": 0.3635,
+    "full_c2_wins": true
+  },
+  "transfer_table": {
+    "full_c2/train": [
+      0.7239125,
+      0.022262586561688356,
+      24
+    ],
+    "full_c2/heldout": [
+      0.75899375,
+      0.040832684040330976,
+      16
+    ],
+    "static/train": [
+      0.2718333333333333,
+      0.027788616774179715,
+      24
+    ],
+    "static/heldout": [
+      0.30901875,
+      0.042095014828807224,
+      16
+    ],
+    "comms/train": [
+      0.327025,
+      0.02849921417045272,
+      24
+    ],
+    "comms/heldout": [
+      0.36345625,
+      0.04236898878823402,
+      16
+    ]
+  },
+  "leaderboard": {
+    "full_c2": {
+      "frontier": 0.759,
+      "milestone_depth": 13.5,
+      "time_to_win": -1.0,
+      "invalid_rate": 0.0582,
+      "cooperation_events": 20.0,
+      "n": 16
+    },
+    "static": {
+      "frontier": 0.309,
+      "milestone_depth": 8.3125,
+      "time_to_win": -1.0,
+      "invalid_rate": 0.2945,
+      "cooperation_events": 0.0,
+      "n": 16
+    },
+    "comms": {
+      "frontier": 0.3635,
+      "milestone_depth": 9.3125,
+      "time_to_win": -1.0,
+      "invalid_rate": 0.3073,
+      "cooperation_events": 16.0,
+      "n": 16
+    }
+  },
+  "pitch_trace": {
+    "seed": "A",
+    "bottleneck_agent": "Madhav",
+    "before": {
+      "frontier": 0.3159,
+      "milestone": "portal_built",
+      "invalid_rate": 0.3026
+    },
+    "after": {
+      "frontier": 0.4835,
+      "milestone": "nether_entered",
+      "invalid_rate": 0.0626
+    },
+    "improved": true,
+    "coach_rationale": "1 execution fix(es) (add missing-prerequisite directives).\n- Madhav: [execution] Madhav failed 'gather' 4x \u2014 right assignment, missing a prerequisite step; keep the role, add a directive.",
+    "card_diff_added_directives": [
+      "Before 'gather', ensure its prerequisites are met (env said: need stone_pickaxe (have 0))."
+    ]
+  },
+  "trained_seeds": [
+    "A",
+    "T2",
+    "T3"
+  ],
+  "heldout_seeds": [
+    "B",
+    "C"
+  ]
+}
