@@ -13,8 +13,6 @@
 > learned strategy carries to **tasks it has never seen**. The game is just the
 > testbed; the result is a *manager that learns to run an agent team.*
 
-Demo video: https://docs.google.com/presentation/d/1O2OL5-C_5DURlFN8SzJjJsOyQ1JbEFFC8SpD6qcpxEo/edit?usp=sharing
-
 ---
 
 ## TL;DR
